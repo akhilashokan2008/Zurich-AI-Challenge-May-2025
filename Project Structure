@@ -1,0 +1,41 @@
+ai_underwriting/
+├── api/
+│   ├── app.py
+│   ├── routes/
+│   ├── auth.py
+│   ├── schemas.py
+│   └── Dockerfile
+├── preprocessor/
+│   ├── main.py
+│   ├── pdf_parser.py
+│   ├── ocr.py
+│   ├── validation.py
+│   └── Dockerfile
+├── worker/
+│   ├── main.py
+│   ├── queue_handler.py
+│   ├── pii_handler.py
+│   └── Dockerfile
+├── autoscaler/
+│   ├── main.py
+│   └── Dockerfile
+├── decision_api/
+│   ├── main.py
+│   └── Dockerfile
+├── models/
+│   ├── llm_server.py
+│   ├── model_registry.py
+│   └── Dockerfile
+├── admin_portal/
+│   ├── main.py
+│   └── Dockerfile
+├── infra/
+│   ├── k8s/
+│   ├── terraform/
+│   ├── helm/
+│   └── secrets/
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── load/
+└── requirements.txt
