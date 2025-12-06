@@ -1,0 +1,17 @@
+# api/app.py
+from fastapi import FastAPI, Depends, UploadFile, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from api.routes import applications
+from api.auth import verify_token
+
+app = FastAPI(title="AI Underwriting API", version="1.0.0")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+@app.middleware("http")
+async def add_tenant_id_header(request, call_next):
+    # multi-tenant support
+    request.state.tenant_id = request.headers.get("X-Tenant-ID")
+    return await call_next(request)
+
+app.include_router(applications.router, prefix="/applications", dependencies=[Depends(verify_token)])
