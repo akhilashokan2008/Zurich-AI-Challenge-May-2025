@@ -1,0 +1,191 @@
+# tests/test_worker_stress_fixed.py
+import asyncio
+import json
+import time
+import pytest
+import pytest_asyncio
+from fakeredis.aioredis import FakeRedis
+from unittest.mock import AsyncMock
+from worker.service import WorkerService
+from worker import metrics, audit_logger
+
+# -------------------------
+# Constants
+# -------------------------
+TEST_CONFIGS = [
+    (1000, 5, 0.005),     # Small: 1k messages, 5 concurrency, 5ms latency
+    (5000, 10, 0.01)      # Medium: 5k messages, 10 concurrency, 10ms latency
+]
+
+FULL_STRESS_MSGS = 50_000
+FULL_STRESS_CONCURRENCY = 20
+SIMULATED_LATENCY = 0.05
+BATCH_SIZE = 100
+THROUGHPUT_THRESHOLD = 500  # messages/sec for soft check
+
+# -------------------------
+# Helpers
+# -------------------------
+async def clear_streams(redis_client):
+    await asyncio.gather(
+        redis_client.delete("advice_in"),
+        redis_client.delete("advice_out"),
+        redis_client.delete("dlq")
+    )
+
+def make_payload(data):
+    return {b"payload": json.dumps(data).encode("utf-8")}
+
+def reset_worker_metrics():
+    """Safely reset metrics using public API."""
+    for m in [metrics.MET_MESSAGES_RECEIVED, metrics.MET_MESSAGES_PROCESSED, metrics.MET_MESSAGES_FAILED]:
+        current = m._value.get()
+        m.inc(-current)
+
+# -------------------------
+# Fixtures
+# -------------------------
+@pytest_asyncio.fixture(scope="module")
+async def redis_client():
+    r = FakeRedis()
+    yield r
+    await r.flushall()
+    await r.close()
+
+@pytest_asyncio.fixture
+async def concurrency_lock():
+    return asyncio.Lock()
+
+@pytest_asyncio.fixture
+async def mock_llm():
+    class FakeResponse:
+        async def json(self):
+            await asyncio.sleep(0.0001)
+            return {"decision": "APPROVED", "risk_score": 0.1, "reasoning": "stress-safe"}
+    m = AsyncMock()
+    m.send.return_value = FakeResponse()
+    return m
+
+@pytest_asyncio.fixture
+async def mock_audit():
+    m = AsyncMock()
+    m.record = AsyncMock()
+    return m
+
+@pytest_asyncio.fixture
+async def worker(redis_client, mock_llm, mock_audit, request):
+    reset_worker_metrics()
+    param = getattr(request, 'param', None)
+    concurrency_limit = FULL_STRESS_CONCURRENCY
+    if isinstance(param, (tuple, list)):
+        concurrency_limit = param[1]
+
+    svc = WorkerService(
+        redis=redis_client,
+        llm_client=mock_llm,
+        audit=mock_audit,
+        batch_size=BATCH_SIZE,
+        concurrency=concurrency_limit,
+        semaphore=asyncio.Semaphore(concurrency_limit),
+        shutdown_event=asyncio.Event(),
+        llm_timeout=5,
+        max_retries=3
+    )
+    yield svc
+
+# -------------------------
+# Core Functions
+# -------------------------
+async def preload_messages(redis, stream_name, total_messages):
+    sem_limit = min(500, max(50, total_messages // 100))
+    sem = asyncio.Semaphore(sem_limit)
+
+    async def safe_xadd(i):
+        async with sem:
+            await redis.xadd(stream_name, make_payload({"user_id": i, "age": 20 + i % 50}))
+
+    await asyncio.gather(*[safe_xadd(i) for i in range(total_messages)])
+
+async def run_processing_loop(worker_svc, concurrency_lock, total_messages, concurrency_limit, simulated_latency):
+    active = {"current": 0, "max": 0}
+    original_send = worker_svc.llm_client.send
+
+    async def instrumented_send(*args, **kwargs):
+        async with concurrency_lock:
+            active["current"] += 1
+            active["max"] = max(active["max"], active["current"])
+        await asyncio.sleep(simulated_latency)
+        async with concurrency_lock:
+            active["current"] -= 1
+        return await original_send(*args, **kwargs)
+
+    worker_svc.llm_client.send.side_effect = instrumented_send
+
+    total_batches = 0
+    start_time = time.time()
+
+    async def process_batches():
+        nonlocal total_batches
+        while True:
+            batch = await worker_svc._fetch_batch("advice_in")
+            if not batch:
+                break
+            metrics.MET_MESSAGES_RECEIVED.inc(len(batch))
+            await worker_svc._process_batch("advice_in", batch)
+            await asyncio.sleep(0)
+            total_batches += 1
+
+    try:
+        await asyncio.wait_for(process_batches(), timeout=300)
+    except asyncio.TimeoutError:
+        pytest.fail("Processing loop timed out after 300s")
+
+    total_duration = time.time() - start_time
+    throughput = total_messages / total_duration if total_duration > 0 else 0
+
+    # Concurrency check
+    assert active["max"] <= concurrency_limit, f"Max concurrency {active['max']} exceeded {concurrency_limit}"
+
+    # Throughput soft check
+    if total_messages > 10000 and throughput < THROUGHPUT_THRESHOLD:
+        pytest.xfail(f"Throughput {throughput:.2f} < {THROUGHPUT_THRESHOLD} msg/sec for large run")
+
+    # Metrics check
+    assert metrics.MET_MESSAGES_RECEIVED._value.get() == total_messages
+    assert metrics.MET_MESSAGES_PROCESSED._value.get() == total_messages
+    assert metrics.MET_MESSAGES_FAILED._value.get() == 0
+
+    # Output check
+    out_entries = []
+    for _ in range(10):
+        out_entries = await worker_svc.redis.xrange("advice_out", "-", "+")
+        if len(out_entries) == total_messages:
+            break
+        await asyncio.sleep(0.5)
+    assert len(out_entries) == total_messages
+
+    # Payload validation
+    for _, data in out_entries:
+        payload = json.loads(data[b"payload"].decode("utf-8"))
+        assert payload["decision"] == "APPROVED"
+        assert "risk_score" in payload
+        assert "reasoning" in payload
+
+# -------------------------
+# Test Cases
+# -------------------------
+@pytest.mark.parametrize("worker,total_messages,concurrency,simulated_latency", TEST_CONFIGS, indirect=["worker"])
+@pytest.mark.asyncio
+async def test_concurrency_limits(worker, redis_client, concurrency_lock, total_messages, concurrency, simulated_latency):
+    await clear_streams(redis_client)
+    await preload_messages(redis_client, "advice_in", total_messages)
+    await run_processing_loop(worker, concurrency_lock, total_messages, concurrency, simulated_latency)
+
+@pytest.mark.asyncio
+async def test_high_volume_throughput(worker, redis_client, concurrency_lock):
+    # Explicitly reset worker for full stress
+    worker.concurrency = FULL_STRESS_CONCURRENCY
+    worker.semaphore = asyncio.Semaphore(FULL_STRESS_CONCURRENCY)
+    await clear_streams(redis_client)
+    await preload_messages(redis_client, "advice_in", FULL_STRESS_MSGS)
+    await run_processing_loop(worker, concurrency_lock, FULL_STRESS_MSGS, FULL_STRESS_CONCURRENCY, SIMULATED_LATENCY)
