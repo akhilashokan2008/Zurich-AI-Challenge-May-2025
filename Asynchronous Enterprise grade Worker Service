@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+Enterprise-grade Worker Service for AI Underwriter Platform.
+
+Features:
+- Async Redis Stream consumer (XREADGROUP) with consumer group and consumer name isolation.
+- Batching and concurrency control with semaphore and TaskGroup.
+- Idempotency via short-lived processing lock + final idempotency marker.
+- Dead Letter Queue (DLQ) support and DLQ metrics.
+- LLM call wrapper (httpx AsyncClient) with circuit breaker and retries.
+- Audit logging (PII-safe) using Loguru.
+- Prometheus metrics (Counters, Histograms, Gauges).
+- OpenTelemetry instrumentation and Sentry integration hooks.
+- FastAPI health endpoints for Kubernetes probes.
+- Clean startup/shutdown and connection pool management.
+- Configurable via environment variables / .env.
+
+Usage:
+- Run as container entrypoint: `python -m worker.src.worker.main`
+- Or use `uvicorn worker.src.worker.main:app --host 0.0.0.0 --port 8080` (health server).
+"""
+
+import os
+import sys
+import json
+import time
+import asyncio
+import signal
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+
+from loguru import logger
+from pydantic import BaseSettings
+import redis.asyncio as redis
+from redis.asyncio import Redis, ConnectionPool
+import httpx
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception_type
+from prometheus_client import start_http_server, Counter, Gauge, Histogram
+import sentry_sdk
+from opentelemetry import trace
+from fastapi import FastAPI
+import hashlib
+
+# -----------------------------
+# Settings
+# -----------------------------
+class Settings(BaseSettings):
+    # Redis
+    REDIS_URL: str = "redis://redis:6379/1"
+    REDIS_POOL_MIN: int = 5
+    REDIS_POOL_MAX: int = 100
+
+    # Stream / Consumer
+    REDIS_STREAM_INPUT: str = "preprocessed_stream"
+    REDIS_CONSUMER_GROUP: str = "risk_group"
+    REDIS_DLQ_STREAM: str = "risk_dlq"
+    REDIS_STREAM_READ_COUNT: int = 50
+    READ_BLOCK_MS: int = 2000
+
+    # Worker concurrency / batching
+    CONCURRENCY_BASE: int = 8
+    MAX_CONCURRENCY: int = 128
+    BATCH_SIZE: int = 20
+    IDENTITY_PREFIX: str = "worker"  # used to build consumer name
+
+    # Idempotency & locks
+    IDEMPOTENCY_TTL: int = 3600  # seconds for final marker
+    PROCESSING_LOCK_TTL: int = 60_000  # ms for short processing lock
+
+    # LLM backend
+    LLM_API_BASE_URL: str = "http://policy-llm:8001/v1"
+    LLM_MODEL: str = "llama3:8b"
+    LLM_TIMEOUT: float = 15.0
+    LLM_CONCURRENCY: int = 10
+    LLM_RETRIES: int = 3
+    LLM_CIRCUIT_THRESHOLD: int = 5
+    LLM_CIRCUIT_COOLDOWN: int = 30  # seconds
+
+    # Metrics
+    PROMETHEUS_PORT: int = 9101
+
+    # Observability
+    SENTRY_DSN: Optional[str] = None
+    OTEL_EXPORTER_ENDPOINT: Optional[str] = None
+
+    # Runtime tuning
+    POLL_SLEEP_EMPTY_SEC: float = 0.5
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+settings = Settings()
+
+# -----------------------------
+# Initialize logging, tracing, sentry
+# -----------------------------
+logger.remove()
+logger.add(sys.stderr, level="INFO", format="{time:ISO8601} | {level} | {message}")
+
+if settings.SENTRY_DSN:
+    sentry_sdk.init(dsn=settings.SENTRY_DSN, traces_sample_rate=1.0)
+
+# OpenTelemetry (best-effort)
+try:
+    if settings.OTEL_EXPORTER_ENDPOINT:
+        provider = trace.get_tracer_provider()
+        # exporter setup omitted for brevity; user can configure exporter in infra
+except Exception:
+    logger.debug("OpenTelemetry init failed or omitted")
+
+# -----------------------------
+# Prometheus Metrics
+# -----------------------------
+MET_MESSAGES_RECEIVED = Counter("risk_messages_received_total", "Messages pulled from Redis stream")
+MET_MESSAGES_PROCESSED = Counter("risk_messages_processed_total", "Messages processed successfully")
+MET_MESSAGES_FAILED = Counter("risk_messages_failed_total", "Messages failed processing", ["error_type"])
+MET_MESSAGES_IDEMPOTENT = Counter("risk_messages_idempotent_total", "Messages skipped due to idempotency")
+MET_IN_FLIGHT = Gauge("risk_in_flight", "Number of messages currently being processed")
+MET_PENDING = Gauge("risk_pending_messages", "Pending messages in stream (approx)")
+MET_DLQ_WRITTEN = Counter("risk_dlq_written_total", "Messages written to DLQ")
+MET_LLM_CALLS = Counter("risk_llm_calls_total", "LLM calls", ["status"])
+MET_LLM_LATENCY = Histogram("risk_llm_latency_seconds", "LLM call latency")
+MET_CONSUMER_ERRORS = Counter("risk_consumer_errors_total", "Consumer loop errors")
+MET_PROCESS_LATENCY = Histogram("risk_process_latency_seconds", "Processing latency per message")
+
+# Start metrics server in background thread
+def _start_metrics():
+    try:
+        start_http_server(settings.PROMETHEUS_PORT)
+        logger.info("Prometheus metrics server started on %d", settings.PROMETHEUS_PORT)
+    except Exception as e:
+        logger.exception("Failed to start Prometheus HTTP server: %s", e)
+
+# -----------------------------
+# Redis pool & LLM client
+# -----------------------------
+REDIS_POOL: Optional[ConnectionPool] = None
+redis_client: Optional[Redis] = None
+llm_client: Optional[httpx.AsyncClient] = None
+LLM_SEMAPHORE = asyncio.Semaphore(settings.LLM_CONCURRENCY)
+
+# -----------------------------
+# Circuit Breaker for LLM (simple Redis-backed)
+# -----------------------------
+class LLMCircuitBreaker:
+    def __init__(self, redis: Redis, threshold: int, cooldown: int):
+        self.redis = redis
+        self.failures_key = "llm:circuit:failures"
+        self.state_key = "llm:circuit:state"
+        self.threshold = threshold
+        self.cooldown = cooldown
+
+    async def allowed(self) -> bool:
+        try:
+            state = await self.redis.get(self.state_key)
+            if state == "open":
+                return False
+        except Exception:
+            # If redis unavailable, conservatively allow and rely on retry/backoff
+            return True
+        return True
+
+    async def record_failure(self):
+        try:
+            fails = await self.redis.incr(self.failures_key)
+            await self.redis.expire(self.failures_key, self.cooldown * 2)
+            if int(fails) >= self.threshold:
+                await self.redis.set(self.state_key, "open", ex=self.cooldown)
+                logger.warning("LLM circuit opened due to %d failures", fails)
+        except Exception:
+            logger.debug("Could not update LLM circuit state in Redis")
+
+    async def record_success(self):
+        try:
+            await self.redis.delete(self.failures_key)
+            await self.redis.delete(self.state_key)
+        except Exception:
+            pass
+
+# -----------------------------
+# Helper utilities
+# -----------------------------
+def pii_safe(val: Optional[str]) -> str:
+    if not val:
+        return ""
+    s = str(val)
+    if len(s) <= 6:
+        return "****"
+    return s[:2] + "****" + s[-2:]
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def make_consumer_name() -> str:
+    # include short uuid to avoid PID collisions across restarts
+    return f"{settings.IDENTITY_PREFIX}_{uuid.uuid4().hex[:8]}"
+
+# -----------------------------
+# Worker service
+# -----------------------------
+class WorkerService:
+    def __init__(self):
+        self.consumer_name = make_consumer_name()
+        self.shutdown_event = asyncio.Event()
+        self._task_group: Optional[asyncio.TaskGroup] = None
+        self._concurrency = settings.CONCURRENCY_BASE
+        self._semaphore = asyncio.Semaphore(self._concurrency)
+        self._latency_history: List[float] = []
+        self._llm_circuit: Optional[LLMCircuitBreaker] = None
+
+    async def start(self):
+        global REDIS_POOL, redis_client, llm_client
+        # initialize redis pool/client
+        REDIS_POOL = ConnectionPool.from_url(settings.REDIS_URL, max_connections=settings.REDIS_POOL_MAX)
+        redis_client = redis.Redis(connection_pool=REDIS_POOL, decode_responses=True)
+        # Test connection
+        try:
+            await redis_client.ping()
+            logger.info("Connected to Redis at %s", settings.REDIS_URL)
+        except Exception as e:
+            logger.exception("Cannot connect to Redis: %s", e)
+            raise
+
+        # Ensure consumer group exists
+        try:
+            await redis_client.xgroup_create(settings.REDIS_STREAM_INPUT, settings.REDIS_CONSUMER_GROUP, id="0", mkstream=True)
+            logger.info("Consumer group created: %s/%s", settings.REDIS_STREAM_INPUT, settings.REDIS_CONSUMER_GROUP)
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.debug("Consumer group already exists")
+            else:
+                logger.exception("xgroup_create error: %s", e)
+                raise
+
+        # create llm client
+        llm_client = httpx.AsyncClient(base_url=settings.LLM_API_BASE_URL, timeout=settings.LLM_TIMEOUT)
+        self._llm_circuit = LLMCircuitBreaker(redis_client, settings.LLM_CIRCUIT_THRESHOLD, settings.LLM_CIRCUIT_COOLDOWN)
+
+        # start metrics server
+        asyncio.create_task(asyncio.to_thread(_start_metrics))
+
+        # start main consumer loop
+        asyncio.create_task(self.consumer_loop())
+
+    async def stop(self):
+        self.shutdown_event.set()
+        # closing httpx & redis gracefully
+        try:
+            if llm_client:
+                await llm_client.aclose()
+        except Exception:
+            pass
+        try:
+            if redis_client:
+                await redis_client.close()
+        except Exception:
+            pass
+        logger.info("WorkerService stopped")
+
+    async def _process_entry(self, msg_id: str, data: Dict[str, Any]) -> bool:
+        """Process a single stream message. Returns True on success (ack now), False otherwise."""
+        start = time.time()
+        MET_MESSAGES_RECEIVED.inc()
+
+        # Wrap in trace span if opentelemetry is configured
+        tracer = trace.get_tracer(__name__)
+        with tracer.start_as_current_span("process_message", attributes={"redis.message_id": msg_id}):
+            try:
+                # Validate expected payload form
+                payload_raw = data.get("payload") or data.get("data") or data.get("message")
+                if not payload_raw:
+                    raise ValueError("Missing payload field")
+
+                # payload_raw may be JSON string or map depending on producer
+                if isinstance(payload_raw, str):
+                    payload = json.loads(payload_raw)
+                elif isinstance(payload_raw, dict):
+                    payload = payload_raw
+                else:
+                    raise ValueError("Unsupported payload type")
+
+                # Determine internal id and idempotency markers
+                internal_id = payload.get("internal_id") or payload.get("id") or (msg_id + "_" + uuid.uuid4().hex[:6])
+                idempotency_key = f"idempotency:{internal_id}"
+                processing_lock = f"proc_lock:{internal_id}"
+
+                # Acquire short processing lock (NX PX)
+                got_lock = await redis_client.set(processing_lock, self.consumer_name, nx=True, px=settings.PROCESSING_LOCK_TTL)
+                if not got_lock:
+                    MET_MESSAGES_IDEMPOTENT.inc()
+                    logger.info("Message %s already being processed by another consumer; skipping", internal_id)
+                    # ack to remove from pending set? We choose to skip ack so pending claims remain; return True to avoid DLQ
+                    return True
+
+                try:
+                    # Check final idempotency marker
+                    if await redis_client.get(idempotency_key):
+                        MET_MESSAGES_IDEMPOTENT.inc()
+                        # acknowledge to remove from stream
+                        await redis_client.xack(settings.REDIS_STREAM_INPUT, settings.REDIS_CONSUMER_GROUP, msg_id)
+                        logger.info("Message %s already finalized previously; acked", internal_id)
+                        return True
+
+                    # Perform document processing (if any) and LLM assessment
+                    # For generality, expect payload.normalized_form and files list
+                    normalized_form = payload.get("normalized_form", {})
+                    file_records = []
+                    try:
+                        files_json = payload.get("files") or "[]"
+                        if isinstance(files_json, str):
+                            file_records = json.loads(files_json)
+                        elif isinstance(files_json, list):
+                            file_records = files_json
+                    except Exception:
+                        file_records = []
+
+                    # Optional: process files concurrently (e.g., decrypt, extract text)
+                    extracted_text = await self._process_files(file_records)
+
+                    # Build downstream payload for LLM
+                    downstream = {
+                        "internal_id": internal_id,
+                        "normalized_form": normalized_form,
+                        "extracted_text": extracted_text
+                    }
+
+                    # Call LLM or fallback
+                    decision = await self._call_llm_with_fallback(downstream)
+
+                    # Write output to result stream
+                    out_stream = settings.REDIS_STREAM_INPUT + "_out"
+                    await redis_client.xadd(out_stream, {"payload": json.dumps(decision)}, nomkstream=True, maxlen=100000, approximate=True)
+
+                    # Mark final idempotency marker
+                    await redis_client.set(idempotency_key, json.dumps({"processed_at": now_iso(), "consumer": self.consumer_name}), ex=settings.IDEMPOTENCY_TTL)
+
+                    # Acknowledge original message
+                    await redis_client.xack(settings.REDIS_STREAM_INPUT, settings.REDIS_CONSUMER_GROUP, msg_id)
+
+                    MET_MESSAGES_PROCESSED.inc()
+                    elapsed = time.time() - start
+                    MET_PROCESS_LATENCY.observe(elapsed)
+                    logger.info("Processed message %s successfully in %.3fs", internal_id, elapsed)
+                    return True
+                finally:
+                    # release processing lock if still owned
+                    try:
+                        owner = await redis_client.get(processing_lock)
+                        if owner == self.consumer_name:
+                            await redis_client.delete(processing_lock)
+                    except Exception:
+                        logger.debug("Failed to release processing lock for %s", internal_id)
+            except json.JSONDecodeError:
+                MET_MESSAGES_FAILED.labels(error_type="JSON_DECODE").inc()
+                logger.exception("JSON decode error for message %s", msg_id)
+                await self._send_to_dlq(msg_id, data, "JSON_DECODE")
+            except ValueError as e:
+                MET_MESSAGES_FAILED.labels(error_type="VALIDATION").inc()
+                logger.warning("Validation error for message %s: %s", msg_id, e)
+                await self._send_to_dlq(msg_id, data, f"VALIDATION: {e}")
+            except Exception as e:
+                MET_MESSAGES_FAILED.labels(error_type=type(e).__name__).inc()
+                logger.exception("Unexpected processing error for %s", msg_id)
+                # send to DLQ
+                await self._send_to_dlq(msg_id, data, f"UNEXPECTED: {type(e).__name__}")
+        return False
+
+    async def _send_to_dlq(self, msg_id: str, data: Dict[str, Any], error: str):
+        """Write original message + error to DLQ and acknowledge original."""
+        try:
+            payload = {
+                "original_msg_id": msg_id,
+                "error": error,
+                "data": json.dumps(data),
+                "timestamp": now_iso()
+            }
+            await redis_client.xadd(settings.REDIS_DLQ_STREAM, payload, nomkstream=True, maxlen=100000, approximate=True)
+            await redis_client.xack(settings.REDIS_STREAM_INPUT, settings.REDIS_CONSUMER_GROUP, msg_id)
+            MET_DLQ_WRITTEN.inc()
+            logger.warning("Sent msg %s to DLQ: %s", msg_id, error)
+        except Exception:
+            logger.exception("Failed to send to DLQ for %s", msg_id)
+
+    async def _process_files(self, file_records: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Mock / extensible file processor — decrypts/reads files and extracts text.
+        In production, hook to S3/GCS fetch, decrypt with KMS, OCR/parse etc.
+        This implementation returns short mocked text snippets to avoid heavy deps.
+        """
+        if not file_records:
+            return {}
+        async def _single_process(record: Dict[str, Any]) -> Tuple[str, str]:
+            filename = record.get("filename", "unknown")
+            # Placeholder: fetch from S3 using s3 key if present. Simulate latency.
+            await asyncio.sleep(0.01)
+            return filename, f"mock-extracted-text-for-{filename}"[:1000]
+        tasks = [asyncio.create_task(_single_process(r)) for r in file_records]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: Dict[str, str] = {}
+        for res in results:
+            if isinstance(res, Exception):
+                logger.debug("File processing error: %s", res)
+                continue
+            k, v = res
+            out[k] = v
+        return out
+
+    async def _call_llm_with_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Call LLM service with circuit breaker and fallback to rule-based assessment."""
+        # short-circuit if circuit open
+        if not await self._llm_circuit.allowed():
+            logger.warning("LLM circuit open, using fallback for %s", payload.get("internal_id"))
+            MET_LLM_CALLS.labels(status="circuit_open").inc()
+            return self._rule_based_decision(payload)
+
+        prompt = self._build_prompt(payload)
+        try:
+            start = time.time()
+            result = await self._call_llm(prompt)
+            MET_LLM_LATENCY.observe(time.time() - start)
+            await self._llm_circuit.record_success()
+            MET_LLM_CALLS.labels(status="success").inc()
+            return result
+        except Exception as e:
+            logger.warning("LLM call failed: %s; falling back: %s", type(e).__name__, e)
+            await self._llm_circuit.record_failure()
+            MET_LLM_CALLS.labels(status="error").inc()
+            return self._rule_based_decision(payload)
+
+    def _build_prompt(self, payload: Dict[str, Any]) -> str:
+        nf = payload.get("normalized_form", {})
+        docs = payload.get("extracted_text", {})
+        # keep prompt concise
+        return f"Applicant: {json.dumps(nf)}\nDocuments summary: {json.dumps(docs)[:1000]}\nReturn JSON: {{'decision': 'APPROVED|REVIEW|DECLINED','risk_score':0.0-1.0,'reasoning':'short'}}"
+
+    async def _call_llm(self, prompt: str) -> Dict[str, Any]:
+        """LLM call wrapped with retries and concurrency limit."""
+        async with LLM_SEMAPHORE:
+            # Tenacity-style retry using AsyncRetrying for async
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(settings.LLM_RETRIES),
+                wait=wait_exponential(multiplier=1, min=1, max=8),
+                retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError))
+            ):
+                with attempt:
+                    # Use httpx async client
+                    resp = await llm_client.post("/chat/completions", json={
+                        "model": settings.LLM_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1
+                    })
+                    resp.raise_for_status()
+                    body = resp.json()
+                    # defensive extraction
+                    choices = body.get("choices") or []
+                    if not choices:
+                        raise ValueError("LLM returned no choices")
+                    content = choices[0].get("message", {}).get("content", "") or ""
+                    # attempt parse of JSON object
+                    parsed = self._extract_first_json(content)
+                    if not parsed:
+                        # return raw text wrapped as fallback
+                        return {"internal_id": payload.get("internal_id"), "decision": "REVIEW", "risk_score": 0.5, "reasoning": content}
+                    return parsed
+            # if retries exhausted, this point reached and exception propagated
+
+    def _extract_first_json(self, s: str) -> Optional[Dict[str, Any]]:
+        """Balanced-brace extractor similar to producer-side counterpart."""
+        if not s:
+            return None
+        start = None
+        depth = 0
+        in_str = False
+        esc = False
+        for i, ch in enumerate(s):
+            if ch == '"' and not esc:
+                in_str = not in_str
+            if in_str and ch == "\\" and not esc:
+                esc = True
+                continue
+            else:
+                esc = False
+            if not in_str:
+                if ch == "{":
+                    if start is None:
+                        start = i
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if start is not None and depth == 0:
+                        try:
+                            return json.loads(s[start:i+1])
+                        except Exception:
+                            return None
+        return None
+
+    def _rule_based_decision(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        nf = payload.get("normalized_form", {})
+        score = 0.5
+        if nf.get("smoker"):
+            score += 0.25
+        bmi = nf.get("bmi", 0) or 0
+        if bmi > 30:
+            score += 0.2
+        age = nf.get("age", 40) or 40
+        if age < 21 or age > 70:
+            score += 0.2
+        score = min(1.0, score)
+        if score < 0.4:
+            decision = "APPROVED"
+        elif score < 0.75:
+            decision = "REVIEW"
+        else:
+            decision = "DECLINED"
+        return {
+            "internal_id": payload.get("internal_id"),
+            "decision": decision,
+            "risk_score": score,
+            "reasoning": f"Rule fallback (smoker={nf.get('smoker')}, bmi={bmi}, age={age})"
+        }
+
+    async def consumer_loop(self):
+        """Main consumer loop: read messages, dispatch to workers, manage concurrency and trimming."""
+        logger.info("Consumer loop starting as consumer=%s", self.consumer_name)
+        while not self.shutdown_event.is_set():
+            try:
+                # Read group messages (new)
+                read_count = min(settings.REDIS_STREAM_READ_COUNT, self._concurrency * settings.BATCH_SIZE)
+                msgs = await redis_client.xreadgroup(
+                    groupname=settings.REDIS_CONSUMER_GROUP,
+                    consumername=self.consumer_name,
+                    streams={settings.REDIS_STREAM_INPUT: ">"},
+                    count=read_count,
+                    block=int(settings.READ_BLOCK_MS)
+                )
+                # msgs: list of (stream, [(msgid, {k:v})])
+                if not msgs:
+                    # Periodic housekeeping: check pending, trim streams
+                    await self._housekeeping()
+                    await asyncio.sleep(settings.POLL_SLEEP_EMPTY_SEC)
+                    continue
+
+                # prepare tasks
+                entries = []
+                for stream_name, records in msgs:
+                    for msg_id, data in records:
+                        entries.append((msg_id, data))
+
+                MET_IN_FLIGHT.set(len(entries))
+                # dispatch tasks in bounded concurrency batches using TaskGroup (Python 3.11+)
+                async with asyncio.TaskGroup() as tg:
+                    for msg_id, data in entries:
+                        # throttle by semaphore
+                        await self._semaphore.acquire()
+                        tg.create_task(self._task_wrapper(msg_id, data))
+                MET_IN_FLIGHT.set(0)
+                # after batch, adaptive concurrency adjust
+                await self._adaptive_adjustments()
+            except Exception as e:
+                MET_CONSUMER_ERRORS.inc()
+                logger.exception("Consumer loop exception: %s", e)
+                # Backoff on repeated failures
+                await asyncio.sleep(1.0)
+
+        logger.info("Consumer loop exiting due to shutdown signal")
+
+    async def _task_wrapper(self, msg_id: str, data: Dict[str, Any]):
+        """Wrap the processing and ensure semaphore release."""
+        try:
+            await self._process_entry(msg_id, data)
+        finally:
+            try:
+                self._semaphore.release()
+            except Exception:
+                pass
+
+    async def _housekeeping(self):
+        """Cleanup: trim streams, check pending, set metrics for pending messages."""
+        try:
+            # xlen approximate
+            length = await redis_client.xlen(settings.REDIS_STREAM_INPUT)
+            MET_PENDING.set(length)
+            # trim out stream
+            await redis_client.xtrim(settings.REDIS_STREAM_INPUT + "_out", maxlen=100000, approximate=True)
+        except Exception:
+            logger.debug("Housekeeping encountered an error", exc_info=True)
+
+    async def _adaptive_adjustments(self):
+        """Adjust concurrency based on latency history and pending messages."""
+        try:
+            # compute avg latency
+            if self._latency_history:
+                avg = sum(self._latency_history) / len(self._latency_history)
+            else:
+                avg = 0.0
+            pending = await redis_client.xlen(settings.REDIS_STREAM_INPUT)
+            # Simple policy: increase concurrency if pending high and avg low, else decrease
+            if pending > settings.BATCH_SIZE * 4 and self._concurrency < settings.MAX_CONCURRENCY and avg < 2.0:
+                self._concurrency = min(self._concurrency + 4, settings.MAX_CONCURRENCY)
+                for _ in range(4):
+                    self._semaphore.release()  # expand available slots
+                logger.info("Increased concurrency to %d (pending=%d, avg_latency=%.2f)", self._concurrency, pending, avg)
+            elif pending < settings.BATCH_SIZE and self._concurrency > settings.CONCURRENCY_BASE:
+                dec = min(4, self._concurrency - settings.CONCURRENCY_BASE)
+                for _ in range(dec):
+                    # reduce semaphore slots by acquiring them permanently
+                    await self._semaphore.acquire()
+                self._concurrency -= dec
+                logger.info("Decreased concurrency to %d (pending=%d, avg_latency=%.2f)", self._concurrency, pending, avg)
+        except Exception:
+            logger.debug("Adaptive adjustments failed", exc_info=True)
+
+# -----------------------------
+# FastAPI health server
+# -----------------------------
+app = FastAPI(title="risk-worker-health")
+
+@app.get("/health/live")
+async def liveness():
+    return {"status": "alive"}
+
+@app.get("/health/ready")
+async def readiness():
+    try:
+        await redis_client.ping()
+        return {"status": "ready"}
+    except Exception as e:
+        return {"status": "not ready", "error": str(e)}
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+worker_service = WorkerService()
+
+def _handle_signal(sig):
+    logger.info("Received signal %s, initiating shutdown", sig)
+    asyncio.create_task(worker_service.stop())
+
+def main():
+    # register signals
+    loop = asyncio.get_event_loop()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(s, lambda s=s: _handle_signal(s))
+        except NotImplementedError:
+            # Windows or restricted envs
+            signal.signal(s, lambda sig, frame: _handle_signal(sig))
+
+    # run startup and consumer loop
+    async def _run():
+        await worker_service.start()
+        # run consumer loop until shutdown
+        await worker_service.consumer_loop()
+
+    try:
+        loop.run_until_complete(_run())
+    except Exception:
+        logger.exception("Worker main failed")
+    finally:
+        logger.info("Worker exiting")
+
+if __name__ == "__main__":
+    main()
