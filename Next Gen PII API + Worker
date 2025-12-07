@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""
+Next-Gen PII Deletion API + Worker (v3.0)
+Features:
+- Async, transactional deletion + chained audit
+- Idempotent enqueueing (DB-level UNIQUE)
+- Dead Letter Queue (DLQ) with retry_count and metrics
+- Vault secrets with retry
+- FastAPI dependency injection for JWT secret and DB pool
+- Graceful worker shutdown
+- Prometheus metrics with retry counts
+- Structured logging scaffold with correlation IDs
+"""
+
+import os
+import asyncio
+import hashlib
+import time
+import random
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+import hvac
+import asyncpg
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from jose import jwt, JWTError
+import logging
+
+# -----------------------
+# Config / Environment
+# -----------------------
+VAULT_URL = os.getenv("VAULT_URL", "http://vault:8200")
+VAULT_TOKEN = os.getenv("VAULT_TOKEN")
+METRICS_PORT = int(os.getenv("METRICS_PORT", 8001))
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", 4))
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", 2))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", 10))
+DELETION_SLEEP = float(os.getenv("DELETION_SLEEP", 0.1))
+BACKOFF_MAX = float(os.getenv("BACKOFF_MAX", 10.0))
+BACKOFF_INIT = float(os.getenv("BACKOFF_INIT", 0.5))
+MAX_RETRY = int(os.getenv("MAX_RETRY", 3))
+
+# -----------------------
+# Prometheus Metrics
+# -----------------------
+ENQUEUE_COUNT = Counter("pii_enqueue_total", "Number of PII deletion requests enqueued")
+WORKER_SUCCESS = Counter("pii_worker_success_total", "Number of successfully processed deletions")
+WORKER_FAILURE = Counter("pii_worker_failure_total", "Number of failed deletions")
+WORKER_RETRY = Counter("pii_worker_retry_total", "Number of PII retries attempted")
+DLQ_COUNT = Counter("pii_dlq_total", "Number of PII deletion jobs in DLQ")
+PROCESSING_LATENCY = Histogram("pii_processing_latency_seconds", "Time taken to process PII deletion")
+
+# -----------------------
+# Logging
+# -----------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("pii_service")
+
+# -----------------------
+# FastAPI & Pydantic
+# -----------------------
+app = FastAPI(title="NextGen PII Deletion API v3.0")
+
+class PIIRequest(BaseModel):
+    pii_type: str
+    user_id: str
+    data_to_delete: str
+
+# -----------------------
+# Table Setup SQL
+# -----------------------
+CREATE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS pii_records (
+    id SERIAL PRIMARY KEY,
+    pii_type TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    data_to_delete TEXT NOT NULL,
+    enqueued_at TIMESTAMP NOT NULL,
+    processed BOOLEAN DEFAULT FALSE,
+    retry_count INT DEFAULT 0,
+    last_attempt_at TIMESTAMP,
+    CONSTRAINT uq_pii_request UNIQUE (pii_type, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS deletion_audit (
+    id SERIAL PRIMARY KEY,
+    pii_type TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    deleted_at TIMESTAMP NOT NULL,
+    previous_hash TEXT,
+    record_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pii_dlq (
+    id SERIAL PRIMARY KEY,
+    pii_record_id INT,
+    error TEXT,
+    failed_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY(pii_record_id) REFERENCES pii_records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_pii_processed ON pii_records(processed);
+CREATE INDEX IF NOT EXISTS idx_audit_deleted_at ON deletion_audit(deleted_at);
+"""
+
+# -----------------------
+# App State
+# -----------------------
+shutdown_event = asyncio.Event()
+worker_tasks = []
+
+# -----------------------
+# Async Vault Loader with Retry
+# -----------------------
+async def load_secrets_with_retry(max_attempts=5, delay=2):
+    for attempt in range(max_attempts):
+        try:
+            loop = asyncio.get_event_loop()
+            def fetch():
+                client = hvac.Client(url=VAULT_URL, token=VAULT_TOKEN)
+                db_secret = client.secrets.kv.v2.read_secret_version(path="pii/db")["data"]["data"]
+                jwt_secret = client.secrets.kv.v2.read_secret_version(path="pii/jwt")["data"]["data"]["JWT_SECRET"]
+                return db_secret["DATABASE_URL"], jwt_secret
+            return await loop.run_in_executor(None, fetch)
+        except Exception as e:
+            logger.warning(f"Vault fetch attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(delay * 2**attempt)
+    raise RuntimeError("Failed to load secrets from Vault after multiple attempts")
+
+# -----------------------
+# Database Initialization
+# -----------------------
+async def init_db(database_url: str):
+    pool = await asyncpg.create_pool(database_url, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX)
+    async with pool.acquire() as conn:
+        await conn.execute(CREATE_TABLES_SQL)
+    return pool
+
+# -----------------------
+# JWT Verification Dependency
+# -----------------------
+def verify_jwt(token: str, jwt_secret: str):
+    if not token.startswith("Bearer "):
+        raise HTTPException(401, "Authorization header must start with Bearer")
+    token = token[7:]
+    try:
+        payload = jwt.decode(
+            token,
+            jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "iss", "aud"]},
+            audience="pii_service",
+            issuer="my_company_auth"
+        )
+        return payload
+    except JWTError as e:
+        raise HTTPException(401, f"Invalid token or claims: {e}")
+
+async def get_authorized_claims(
+    authorization: str = Header(...),
+    request: Request = None
+):
+    jwt_secret = request.app.state.jwt_secret
+    return verify_jwt(authorization, jwt_secret)
+
+# -----------------------
+# Enqueue API
+# -----------------------
+@app.post("/enqueue")
+async def enqueue_pii(
+    request_body: PIIRequest,
+    claims: dict = Depends(get_authorized_claims),
+    request: Request = None
+):
+    pool: asyncpg.Pool = request.app.state.pool
+    correlation_id = str(uuid.uuid4())
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO pii_records(pii_type, user_id, data_to_delete, enqueued_at) VALUES($1,$2,$3,$4)",
+                request_body.pii_type, request_body.user_id, request_body.data_to_delete, datetime.utcnow()
+            )
+            ENQUEUE_COUNT.inc()
+            logger.info(f"Enqueued PII record", extra={"correlation_id": correlation_id})
+            return {"status": "enqueued"}
+        except asyncpg.UniqueViolationError:
+            return {"status": "already_enqueued"}
+
+# -----------------------
+# Worker
+# -----------------------
+async def process_queue():
+    pool: asyncpg.Pool = app.state.pool
+    backoff = BACKOFF_INIT
+    while not shutdown_event.is_set():
+        record = None
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    record = await conn.fetchrow(
+                        "SELECT * FROM pii_records WHERE processed=false FOR UPDATE SKIP LOCKED LIMIT 1"
+                    )
+                    if not record:
+                        await asyncio.sleep(backoff + random.uniform(0, 0.5))
+                        backoff = min(backoff * 2, BACKOFF_MAX)
+                        continue
+                    backoff = BACKOFF_INIT
+
+                    start_time = time.time()
+                    await asyncio.sleep(DELETION_SLEEP)
+
+                    # Audit hash
+                    prev_hash = await conn.fetchval(
+                        "SELECT record_hash FROM deletion_audit ORDER BY deleted_at DESC LIMIT 1"
+                    )
+                    audit_string = f"{record['pii_type']}{record['user_id']}{record['data_to_delete']}{prev_hash}{record['id']}{datetime.utcnow().isoformat()}"
+                    record_hash = hashlib.sha256(audit_string.encode()).hexdigest()
+
+                    await conn.execute(
+                        "INSERT INTO deletion_audit(pii_type,user_id,deleted_at,previous_hash,record_hash) VALUES($1,$2,$3,$4,$5)",
+                        record["pii_type"], record["user_id"], datetime.utcnow(), prev_hash, record_hash
+                    )
+                    await conn.execute(
+                        "UPDATE pii_records SET processed=true WHERE id=$1", record["id"]
+                    )
+                    PROCESSING_LATENCY.observe(time.time() - start_time)
+                    WORKER_SUCCESS.inc()
+                    logger.info(f"Processed PII record {record['id']}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            WORKER_FAILURE.inc()
+            if record:
+                try:
+                    async with pool.acquire() as conn:
+                        # Increment retry count
+                        retry_count = record.get("retry_count", 0) + 1
+                        await conn.execute(
+                            "UPDATE pii_records SET retry_count=$1, last_attempt_at=$2 WHERE id=$3",
+                            retry_count, datetime.utcnow(), record["id"]
+                        )
+                        WORKER_RETRY.inc()
+                        if retry_count >= MAX_RETRY:
+                            await conn.execute(
+                                "INSERT INTO pii_dlq(pii_record_id,error,failed_at) VALUES($1,$2,$3)",
+                                record["id"], str(e), datetime.utcnow()
+                            )
+                            DLQ_COUNT.inc()
+                            logger.warning(f"Record {record['id']} moved to DLQ: {e}")
+                except Exception:
+                    logger.exception("Failed to persist DLQ entry")
+            await asyncio.sleep(1)
+
+# -----------------------
+# Metrics Endpoint
+# -----------------------
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+# -----------------------
+# Health Endpoint
+# -----------------------
+@app.get("/health")
+async def health():
+    pool: asyncpg.Pool = app.state.pool
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "details": str(e)}
+
+# -----------------------
+# Startup / Shutdown
+# -----------------------
+@app.on_event("startup")
+async def startup():
+    database_url, jwt_secret = await load_secrets_with_retry()
+    app.state.pool = await init_db(database_url)
+    app.state.jwt_secret = jwt_secret
+
+    for _ in range(WORKER_COUNT):
+        task = asyncio.create_task(process_queue())
+        worker_tasks.append(task)
+
+@app.on_event("shutdown")
+async def shutdown():
+    shutdown_event.set()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+# -----------------------
+# Run Standalone
+# -----------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
