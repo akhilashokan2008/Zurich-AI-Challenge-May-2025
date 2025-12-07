@@ -1,0 +1,316 @@
+# policy_service/main.py
+import asyncio
+import hashlib
+import json
+import logging
+import uuid
+import time
+from typing import List, Dict, Any, Optional
+
+import httpx
+import redis.asyncio as aioredis
+from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+from pydantic_settings import BaseSettings
+from contextlib import asynccontextmanager
+from pythonjsonlogger import jsonlogger
+from prometheus_client import Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+# ===========================
+# CONFIGURATION
+# ===========================
+class Settings(BaseSettings):
+    """Configuration loaded from environment variables or secrets manager."""
+    MAX_BATCH_SIZE: int
+    BATCH_TIMEOUT: float = 0.05
+    CACHE_TTL: int = 300
+    REDIS_URL: str
+    NUM_BATCH_WORKERS: int = 2
+    MODEL_INFERENCE_URL: str
+    REQUESTS_PER_MINUTE_LIMIT: int = 100
+    API_TIMEOUT: float = 10.0
+    MODEL_TIMEOUT: float = 5.0
+    _env_file = ".env"
+
+settings = Settings()
+
+# ===========================
+# LOGGING SETUP
+# ===========================
+logger = logging.getLogger("policy-llm-service")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter()
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# ===========================
+# PROMETHEUS METRICS
+# ===========================
+API_LATENCY_HIST = Histogram(
+    "policy_service_api_latency_seconds",
+    "Latency of API requests",
+    ["endpoint"]
+)
+
+BATCH_SIZE_HIST = Histogram(
+    "batch_processor_batch_size",
+    "Number of requests in each processed batch"
+)
+
+MODEL_LATENCY_HIST = Histogram(
+    "batch_processor_model_latency_seconds",
+    "Latency of external model inference per batch"
+)
+
+WORKER_GAUGE = Gauge(
+    "batch_processor_active_workers",
+    "Number of active batch worker tasks"
+)
+
+# ===========================
+# MODELS
+# ===========================
+class PolicyRequest(BaseModel, extra="forbid"):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    age: int = Field(..., ge=18, le=120)
+    policy_type: str = Field(..., pattern=r"^[A-Z_]+$")
+    features: Dict[str, float] = Field(default={}, max_items=50)
+
+    @validator("features")
+    def validate_keys(cls, v):
+        for k in v.keys():
+            if len(k) > 50:
+                raise ValueError("Feature keys too long")
+        return v
+
+class PolicyResponse(BaseModel):
+    decision: str
+    risk_score: float
+    explanation: str
+    request_id: str
+    client_request_id: Optional[str] = None
+
+# ===========================
+# BATCH PROCESSOR
+# ===========================
+class BatchProcessor:
+    """Concurrent batch processor for model inference with metrics."""
+    def __init__(self, max_size: int, timeout: float, workers: int, http_client: httpx.AsyncClient):
+        self.max_size = max_size
+        self.timeout = timeout
+        self.workers = workers
+        self.http_client = http_client
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.tasks: List[asyncio.Task] = []
+
+    def start(self):
+        for i in range(self.workers):
+            WORKER_GAUGE.inc()
+            logger.info({"event": "worker_start", "worker_id": i})
+            task = asyncio.create_task(self.batch_worker(i))
+            self.tasks.append(task)
+
+    async def stop(self):
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        WORKER_GAUGE.set(0)
+        logger.info({"event": "all_workers_stopped"})
+
+    async def submit(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fut = asyncio.get_event_loop().create_future()
+        await self.queue.put({"payload": payload, "future": fut})
+        try:
+            return await asyncio.wait_for(fut, timeout=settings.API_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error({"event": "inference_timeout_api", "request_id": payload.get("request_id")})
+            raise HTTPException(status_code=503, detail="Inference service unavailable (timeout)")
+
+    async def batch_worker(self, worker_id: int):
+        while True:
+            batch_items = []
+            try:
+                item = await asyncio.wait_for(self.queue.get(), timeout=self.timeout)
+                batch_items.append(item)
+                while len(batch_items) < self.max_size:
+                    try:
+                        batch_items.append(self.queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                BATCH_SIZE_HIST.observe(len(batch_items))
+                batch_payloads = [i["payload"]["request_data"] for i in batch_items]
+
+                # Measure model inference latency
+                start = time.monotonic()
+                responses = await self._call_external_model(batch_payloads, worker_id)
+                MODEL_LATENCY_HIST.observe(time.monotonic() - start)
+
+                if len(responses) != len(batch_items):
+                    raise RuntimeError(f"Model returned {len(responses)} items, expected {len(batch_items)}.")
+
+                for i, resp in zip(batch_items, responses):
+                    resp['request_id'] = i["payload"]["request_id"]
+                    resp['client_request_id'] = i["payload"]["client_request_id"]
+                    if not i["future"].done():
+                        i["future"].set_result(resp)
+                    self.queue.task_done()
+
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.exception({"event": "batch_worker_error", "worker_id": worker_id, "batch_size": len(batch_items), "error": str(e)})
+                for i in batch_items:
+                    if not i["future"].done():
+                        i["future"].set_exception(HTTPException(status_code=500, detail="Internal inference error"))
+                    self.queue.task_done()
+
+    async def _call_external_model(self, payloads: List[Dict[str, Any]], worker_id: int) -> List[Dict[str, Any]]:
+        start = time.monotonic()
+        try:
+            resp = await self.http_client.post(
+                settings.MODEL_INFERENCE_URL,
+                json=payloads,
+                timeout=settings.MODEL_TIMEOUT
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            latency_ms = (time.monotonic() - start) * 1000
+            logger.info({"event": "model_inference_success", "size": len(payloads), "worker_id": worker_id, "latency_ms": f"{latency_ms:.2f}"})
+            if not isinstance(result, list):
+                raise ValueError("Model returned non-list response")
+            return result
+        except httpx.RequestError as e:
+            logger.error({"event": "model_http_request_failed", "error": str(e)})
+            raise HTTPException(status_code=503, detail="Model service unavailable")
+        except httpx.HTTPStatusError as e:
+            logger.error({"event": "model_http_status_error", "status_code": e.response.status_code})
+            raise HTTPException(status_code=502, detail="Model returned bad status")
+        except (json.JSONDecodeError, ValueError):
+            logger.error({"event": "model_invalid_response"})
+            raise HTTPException(status_code=502, detail="Model returned invalid JSON")
+
+# ===========================
+# LIFESPAN MANAGEMENT
+# ===========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    redis = await aioredis.from_url(
+        settings.REDIS_URL, decode_responses=True,
+        socket_connect_timeout=5, max_connections=50
+    )
+    client = httpx.AsyncClient()
+    processor = BatchProcessor(settings.MAX_BATCH_SIZE, settings.BATCH_TIMEOUT, settings.NUM_BATCH_WORKERS, client)
+    processor.start()
+    # store resources in app.state
+    app.state.lifespan_resources = {"redis": redis, "http_client": client, "batch_processor": processor}
+    yield
+    await processor.stop()
+    await client.aclose()
+    await redis.close()
+
+app = FastAPI(lifespan=lifespan, title="Policy LLM Service", version="3.1.0")
+
+# ===========================
+# DEPENDENCIES
+# ===========================
+async def get_resources(app: FastAPI = Depends()):
+    return app.state.lifespan_resources
+
+async def get_redis(resources: Dict[str, Any] = Depends(get_resources)):
+    return resources["redis"]
+
+async def get_batch_processor(resources: Dict[str, Any] = Depends(get_resources)):
+    return resources["batch_processor"]
+
+async def get_client_request_id(request: Request) -> Optional[str]:
+    return request.headers.get("X-Request-ID")
+
+# ===========================
+# RATE LIMITING
+# ===========================
+async def rate_limit_check(req: PolicyRequest, redis: aioredis.Redis = Depends(get_redis)):
+    key = f"rate:{req.user_id}:{int(time.time() // 60)}"
+    try:
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, 120)
+        if count > settings.REQUESTS_PER_MINUTE_LIMIT:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Rate limiter unavailable")
+
+# ===========================
+# CACHE UTILITIES
+# ===========================
+def compute_cache_key(req: PolicyRequest) -> str:
+    payload_bytes = json.dumps(req.model_dump(exclude_defaults=True), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+async def check_cache(req: PolicyRequest, redis: aioredis.Redis):
+    key = compute_cache_key(req)
+    try:
+        cached = await redis.get(key)
+        if cached:
+            return json.loads(cached)
+    except Exception as e:
+        logger.warning({"event": "cache_read_error", "key": key, "error": str(e)})
+    return None
+
+async def set_cache(req: PolicyRequest, resp: Dict, redis: aioredis.Redis):
+    key = compute_cache_key(req)
+    if "decision" in resp:
+        try:
+            await redis.set(key, json.dumps(resp), ex=settings.CACHE_TTL)
+        except Exception as e:
+            logger.warning({"event": "cache_write_error", "key": key, "error": str(e)})
+
+# ===========================
+# API ENDPOINTS
+# ===========================
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health_check(redis: aioredis.Redis = Depends(get_redis), batch_processor: BatchProcessor = Depends(get_batch_processor)):
+    try:
+        await redis.ping()
+        return {"status": "ok", "redis": "connected", "workers_running": len(batch_processor.tasks), "model_url": settings.MODEL_INFERENCE_URL}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Dependency failure")
+
+@app.get("/metrics")
+async def metrics():
+    return JSONResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.post("/infer", response_model=PolicyResponse, dependencies=[Depends(rate_limit_check)])
+async def infer(
+    request: PolicyRequest,
+    redis: aioredis.Redis = Depends(get_redis),
+    batch_processor: BatchProcessor = Depends(get_batch_processor),
+    client_request_id: Optional[str] = Depends(get_client_request_id),
+):
+    internal_request_id = str(uuid.uuid4())
+    logger.info({"event": "request_received", "client_id": client_request_id, "internal_id": internal_request_id, "user_id": request.user_id})
+
+    cached = await check_cache(request, redis)
+    if cached:
+        logger.info({"event": "cache_hit", "client_id": client_request_id, "latency_ms": "0.00"})
+        return cached
+
+    payload = {
+        "request_data": request.model_dump(),
+        "request_id": internal_request_id,
+        "client_request_id": client_request_id
+    }
+
+    start_time = time.monotonic()
+    try:
+        resp = await batch_processor.submit(payload)
+        await set_cache(request, resp, redis)
+        API_LATENCY_HIST.labels(endpoint="/infer").observe(time.monotonic() - start_time)
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception({"event": "inference_failed_unknown", "client_id": client_request_id, "internal_id": internal_request_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail="Unexpected error during policy evaluation")
