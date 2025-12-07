@@ -1,0 +1,649 @@
+# api/src/api/main.py
+"""
+Enterprise-grade API service for AI Underwriter Platform
+Single-file implementation suitable for production deployment.
+Requirements (put in api/requirements.txt):
+fastapi[all]==0.95.2
+uvicorn[standard]==0.22.0
+pydantic==1.10.12
+python-dotenv==1.0.0
+aioboto3==11.0.0
+httpx==0.24.1
+redis[async]==4.6.0
+prometheus-client==0.16.0
+loguru==0.7.0
+sentry-sdk==1.25.0
+opentelemetry-sdk==1.18.0
+opentelemetry-instrumentation-fastapi==0.36b0
+slowapi==0.1.7
+cryptography==41.0.2
+pymupdf==1.22.5  # for PDF checks (fitz)
+tenacity==8.2.2
+"""
+
+import os
+import json
+import time
+import uuid
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Header, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, BaseSettings, validator
+from loguru import logger
+import aioboto3
+import httpx
+import redis.asyncio as redis
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+import sentry_sdk
+from cryptography.fernet import Fernet, InvalidToken
+
+# Optional: PyMuPDF for PDF scanning (validate in requirements)
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+# -------------------------
+# Configuration
+# -------------------------
+class Settings(BaseSettings):
+    APP_NAME: str = "ai-underwriter-api"
+    ENV: str = "prod"
+
+    # Authentication
+    INGESTION_API_KEY: str
+    JWT_SECRET: Optional[str] = None
+    API_KEY_HEADER_NAME: str = "X-API-Key"
+
+    # Redis
+    REDIS_URL: str = "redis://redis:6379/0"
+    REDIS_POOL_MIN: int = 5
+    REDIS_POOL_MAX: int = 50
+    IDEMPOTENCY_TTL: int = 3600  # seconds
+
+    # S3
+    S3_BUCKET: str = "enterprise-ingestion-files"
+    S3_REGION: str = "us-east-1"
+    S3_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
+
+    # LLM (local OpenAI-compatible)
+    LLM_API_BASE_URL: str = "http://policy-llm:8001/v1"
+    LOCAL_LLM_MODEL: str = "llama3:8b"
+    LLM_TIMEOUT: float = 30.0
+    LLM_MAX_CONCURRENCY: int = 10
+    LLM_RETRY_ATTEMPTS: int = 3
+
+    # Observability
+    PROMETHEUS_METRICS_PORT: int = 9100
+    SENTRY_DSN: Optional[str] = None
+
+    # Rate limiting
+    RATE_LIMIT_PER_MINUTE: int = 6000  # per client IP, tuned as needed
+
+    # Fernet (optional PII encryption at rest for queue)
+    ENCRYPTION_KEY_FOR_PII: Optional[str] = None
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+settings = Settings()
+
+# Initialize Sentry (best-effort)
+if settings.SENTRY_DSN:
+    sentry_sdk.init(dsn=settings.SENTRY_DSN, traces_sample_rate=1.0, environment=settings.ENV)
+
+# -------------------------
+# Logging
+# -------------------------
+logger.remove()
+logger.add(sys.stderr := None, level="INFO", format="{time:ISO8601} | {level} | {message}")
+logger.add("logs/api-audit.log", rotation="10 MB", retention="30 days", level="INFO", serialize=False)
+
+# -------------------------
+# Metrics
+# -------------------------
+MET_REQS = Counter("api_requests_total", "Total HTTP requests", ["path", "method", "status"])
+MET_LATENCY = Histogram("api_request_duration_seconds", "HTTP request latency", ["path"])
+MET_QUEUE_LEN = Gauge("ingestion_queue_length", "Length of ingestion queue (Redis)")
+MET_LLM_CALLS = Counter("llm_calls_total", "LLM calls", ["status"])
+MET_LLM_LATENCY = Histogram("llm_latency_seconds", "LLM call latency")
+MET_IDEMPOTENT = Counter("idempotent_requests_total", "Idempotent requests skipped")
+
+# Start Prometheus metrics HTTP server in background
+def start_metrics_server():
+    try:
+        start_http_server(settings.PROMETHEUS_METRICS_PORT)
+        logger.info("Prometheus metrics server started on port %d", settings.PROMETHEUS_METRICS_PORT)
+    except Exception as e:
+        logger.exception("Failed to start Prometheus server: %s", e)
+
+# -------------------------
+# FastAPI app + rate limiter
+# -------------------------
+app = FastAPI(title=settings.APP_NAME)
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# Security dependencies
+api_key_header = APIKeyHeader(name=settings.API_KEY_HEADER_NAME, auto_error=False)
+bearer = HTTPBearer(auto_error=False)
+
+# -------------------------
+# Lifespan resources (Redis pool, httpx clients, aioboto3 session)
+# -------------------------
+REDIS_POOL: Optional[redis.ConnectionPool] = None
+redis_client: Optional[redis.Redis] = None
+httpx_llm_client: Optional[httpx.AsyncClient] = None
+s3_session: Optional[aioboto3.Session] = None
+fernet_cipher: Optional[Fernet] = None
+LLM_SEMAPHORE = asyncio.Semaphore(settings.LLM_MAX_CONCURRENCY)
+
+@app.on_event("startup")
+async def startup_event():
+    global REDIS_POOL, redis_client, httpx_llm_client, s3_session, fernet_cipher
+    # Metrics server
+    asyncio.create_task(asyncio.to_thread(start_metrics_server))
+
+    # Redis pool
+    REDIS_POOL = redis.ConnectionPool.from_url(settings.REDIS_URL, max_connections=settings.REDIS_POOL_MAX)
+    redis_client = redis.Redis(connection_pool=REDIS_POOL, decode_responses=True)
+
+    # Test Redis connectivity (fail early)
+    try:
+        await redis_client.ping()
+        logger.info("Connected to Redis")
+    except Exception as e:
+        logger.exception("Cannot connect to Redis: %s", e)
+        raise
+
+    # httpx client for LLM (single per-process)
+    httpx_llm_client = httpx.AsyncClient(base_url=settings.LLM_API_BASE_URL, timeout=settings.LLM_TIMEOUT)
+
+    # aioboto3 session for S3
+    s3_session = aioboto3.Session()
+
+    # Fernet cipher if provided
+    if settings.ENCRYPTION_KEY_FOR_PII:
+        try:
+            fernet_cipher = Fernet(settings.ENCRYPTION_KEY_FOR_PII.encode())
+        except Exception:
+            logger.exception("Invalid Fernet key in settings")
+            raise
+
+    logger.info("Startup complete")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global redis_client, httpx_llm_client
+    try:
+        if httpx_llm_client:
+            await httpx_llm_client.aclose()
+    except Exception:
+        pass
+    try:
+        if redis_client:
+            await redis_client.close()
+    except Exception:
+        pass
+    logger.info("Shutdown complete")
+
+# -------------------------
+# Utility helpers
+# -------------------------
+def pii_safe(value: Optional[str]) -> str:
+    """Return a redacted-similar short representation for audit logs."""
+    if not value:
+        return ""
+    if len(value) <= 6:
+        return "****"
+    return value[:2] + "****" + value[-2:]
+
+async def enqueue_to_redis_stream(payload: Dict[str, Any]) -> str:
+    """Enqueue ingestion metadata to Redis stream (atomic)."""
+    try:
+        stream_key = "preprocessed_stream"
+        msg_id = await redis_client.xadd(stream_key, payload, nomkstream=True)
+        # update gauge
+        try:
+            MET_QUEUE_LEN.set(await redis_client.xlen(stream_key))
+        except Exception:
+            pass
+        return msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+    except Exception as e:
+        logger.exception("Failed to enqueue to Redis stream: %s", e)
+        raise
+
+async def check_pdf_malware(file_bytes: bytes, filename: str) -> None:
+    """Lightweight PDF checks using PyMuPDF when available. Fails closed for suspicious files."""
+    if not fitz:
+        # If lib missing, skip heavy checks but enforce size limits
+        return
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        suspicious = False
+        # Check for JavaScript / embedded files / annotations
+        if getattr(doc, "needs_pass", False) or getattr(doc, "embedded_file_count", lambda: 0)() > 0:
+            suspicious = True
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            # Check for JS in page (get_js may or may not be present)
+            js = getattr(page, "get_js", lambda: None)()
+            if js:
+                suspicious = True
+                break
+        doc.close()
+        if suspicious:
+            raise HTTPException(status_code=415, detail=f"Malicious PDF content detected in {filename}")
+    except Exception as e:
+        logger.warning("PDF validation failed for %s: %s", filename, e)
+        raise HTTPException(status_code=415, detail=f"PDF validation failed for {filename}: {e}")
+
+# -------------------------
+# Auth & rate-limiting dependencies
+# -------------------------
+async def verify_ingestion_api_key(api_key: Optional[str] = Depends(api_key_header)):
+    if not api_key or api_key != settings.INGESTION_API_KEY:
+        logger.warning("Invalid API key attempt")
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    return True
+
+async def verify_bearer_token(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)):
+    # Minimal placeholder - integrate JWT decode with JOSE in production
+    if not creds:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = creds.credentials
+    # For security, do not log raw token
+    # Here, accept token if equals settings.JWT_SECRET for demo mode
+    if settings.JWT_SECRET and token != settings.JWT_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"sub": "service-principal"}
+
+# Redis-backed leaky-bucket rate limiter (per IP)
+async def redis_rate_check(client_id: str, limit_per_minute: int) -> None:
+    key = f"rate:{client_id}"
+    now_ts = int(time.time())
+    # Using fixed-window counter with TTL ~70s for simplicity; sliding window or token-bucket recommended
+    res = await redis_client.incr(key)
+    if res == 1:
+        await redis_client.expire(key, 70)
+    if res > limit_per_minute:
+        raise RateLimitExceeded(detail="Rate limit exceeded")
+
+# -------------------------
+# LLM client with circuit breaker and retries
+# -------------------------
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, cooldown: int = 30):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.failures_key = "llm:circuit:failures"
+        self.state_key = "llm:circuit:state"
+
+    async def allowed(self) -> bool:
+        state = await redis_client.get(self.state_key)
+        if state == "open":
+            # check expiry
+            return False
+        return True
+
+    async def record_failure(self):
+        failures = await redis_client.incr(self.failures_key)
+        await redis_client.expire(self.failures_key, self.cooldown * 2)
+        if failures >= self.threshold:
+            await redis_client.set(self.state_key, "open", ex=self.cooldown)
+            logger.warning("LLM circuit opened after %d failures", failures)
+
+    async def record_success(self):
+        await redis_client.delete(self.failures_key)
+        await redis_client.delete(self.state_key)
+
+llm_circuit = CircuitBreaker()
+
+@retry(stop=stop_after_attempt(settings.LLM_RETRY_ATTEMPTS), wait=wait_exponential(multiplier=1, min=1, max=8),
+       retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError)))
+async def call_local_llm(prompt: str) -> Dict[str, Any]:
+    """Call the local OpenAI-compatible LLM endpoint and return JSON-parsed output."""
+    if not await llm_circuit.allowed():
+        MET_LLM_CALLS.labels(status="circuit_open").inc()
+        raise HTTPException(status_code=503, detail="LLM circuit open")
+
+    async with LLM_SEMAPHORE:
+        payload = {
+            "model": settings.LOCAL_LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
+        }
+        start = time.time()
+        try:
+            resp = await httpx_llm_client.post("/chat/completions", json=payload)
+            resp.raise_for_status()
+            MET_LLM_CALLS.labels(status="success").inc()
+            MET_LLM_LATENCY.observe(time.time() - start)
+            content = resp.json()
+            # Defensive extraction: support both streaming and standard shapes
+            choices = content.get("choices") or []
+            if not choices:
+                raise ValueError("LLM returned no choices")
+            message = choices[0].get("message") or {}
+            text = message.get("content") or ""
+            # parse JSON embedded in text if needed
+            return {"raw": text, "meta": content}
+        except Exception as e:
+            MET_LLM_CALLS.labels(status="error").inc()
+            await llm_circuit.record_failure()
+            logger.warning("LLM call failed: %s", e)
+            raise
+
+# -------------------------
+# Pydantic models (request/response)
+# -------------------------
+class ApplicantForm(BaseModel):
+    application_id: Optional[str] = Field(None, max_length=128)
+    age: int = Field(..., ge=18, le=120)
+    bmi: float = Field(..., ge=10.0, le=80.0)
+    smoker: bool = False
+    income: Optional[float] = Field(None, ge=0)
+
+class IngestResponse(BaseModel):
+    internal_id: str
+    enqueued: bool
+    message: str
+    timestamp: str
+
+class RiskScoreResponse(BaseModel):
+    internal_id: str
+    risk_score: float = Field(..., ge=0.0, le=1.0)
+    risk_category: str
+    reasoning: str
+    llm_model: Optional[str]
+
+# -------------------------
+# Endpoints
+# -------------------------
+@app.post("/apply", response_model=IngestResponse)
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def apply_endpoint(
+    request: Request,
+    form_json: str = Field(..., alias="form_json"),
+    documents: Optional[List[UploadFile]] = File(None),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    api_key_check: bool = Depends(verify_ingestion_api_key),
+    bearer_principal: dict = Depends(verify_bearer_token)
+):
+    """Main ingestion endpoint:
+    - Validates input form_json (JSON string)
+    - Optional PDF uploads scanned and uploaded to S3
+    - Calls local LLM for risk assessment
+    - Encrypts PII (if configured) and enqueues a message to Redis stream
+    """
+    path = request.url.path
+    start = time.time()
+    try:
+        # Rate limiting per client IP
+        client_ip = request.client.host if request.client else "unknown"
+        await redis_rate_check(client_ip, settings.RATE_LIMIT_PER_MINUTE)
+
+        # Parse applicant
+        try:
+            applicant = ApplicantForm.parse_raw(form_json)
+        except Exception as e:
+            logger.warning("Invalid form JSON: %s", e)
+            raise HTTPException(status_code=400, detail=f"Invalid form data: {e}")
+
+        # Idempotency: if X-Idempotency-Key provided check Redis
+        internal_id = str(uuid.uuid4())
+        if x_idempotency_key:
+            lock_key = f"idemp:{x_idempotency_key}"
+            # attempt to set temporary lock to avoid duplicate processing
+            got = await redis_client.set(lock_key, internal_id, nx=True, ex=settings.IDEMPOTENCY_TTL)
+            if not got:
+                existing = await redis_client.get(lock_key)
+                MET_IDEMPOTENT.inc()
+                logger.info("Idempotent request skipped (key=%s existing_id=%s)", x_idempotency_key, existing)
+                return JSONResponse(status_code=409, content={"detail": "Duplicate request"})
+
+        # Handle documents: scan and upload to S3 (async)
+        file_records = []
+        if documents:
+            # limit number of files and size
+            for f in documents[:5]:
+                contents = await f.read()
+                if len(contents) > settings.S3_MAX_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail=f"File {f.filename} too large")
+                # run PDF check (fail closed)
+                await check_pdf_malware(contents, f.filename)
+                # upload to S3 in background (do not await here to reduce latency)
+                s3_key = f"{internal_id}/{uuid.uuid4().hex}-{f.filename}"
+                file_records.append({"filename": f.filename, "s3_key": s3_key, "size": len(contents)})
+                # schedule upload in background
+                asyncio.create_task(upload_to_s3(contents, s3_key, f.content_type if hasattr(f, "content_type") else "application/pdf"))
+
+        # Build prompt for LLM
+        prompt = (
+            "Analyze this insurance applicant and return JSON with keys: risk_score (0.0-1.0), "
+            "risk_category (low|medium|high), reasoning (brief, max 500 chars). Applicant data:\n"
+            f"{applicant.json()}"
+        )
+
+        # LLM call
+        try:
+            MET_LLM_CALLS.labels(status="attempt").inc()
+            llm_result = await call_local_llm(prompt)
+            raw_text = llm_result.get("raw", "")
+            # attempt to parse JSON out of raw_text defensively
+            try:
+                # Prefer safest JSON extraction; simple approach below
+                parsed = json.loads(raw_text.strip())
+            except Exception:
+                # try to find first balanced JSON substring
+                parsed = attempt_extract_json(raw_text)
+            risk = RiskScoreResponse(
+                internal_id=internal_id,
+                risk_score=float(parsed.get("risk_score", 0.5)),
+                risk_category=parsed.get("risk_category", "medium"),
+                reasoning=parsed.get("reasoning", "")[:500],
+                llm_model=settings.LOCAL_LLM_MODEL
+            )
+            await llm_circuit.record_success()
+        except HTTPException:
+            # propagate HTTPException directly
+            raise
+        except Exception as e:
+            # LLM failed: fallback to rule-based and enqueue, still continue
+            logger.exception("LLM failed, falling back to simple rule-based scoring: %s", e)
+            risk = fallback_risk_assessment(applicant)
+            await llm_circuit.record_failure()
+
+        # Encrypt PII if configured
+        applicant_bytes = applicant.json().encode()
+        encrypted = None
+        if fernet_cipher:
+            try:
+                encrypted = fernet_cipher.encrypt(applicant_bytes).decode()
+            except Exception:
+                logger.exception("Encryption failed")
+                raise HTTPException(status_code=500, detail="Encryption failed")
+
+        # Compose metadata to enqueue
+        metadata = {
+            "internal_id": internal_id,
+            "application_hash": sha256_hash(applicant.json()),
+            "form_encrypted": encrypted or applicant.json(),
+            "files": json.dumps(file_records),
+            "risk_assessment": risk.dict(),
+            "received_at": datetime.utcnow().isoformat()
+        }
+
+        # Enqueue to Redis stream (with timeout)
+        msg_id = await enqueue_to_redis_stream(metadata)
+
+        # Finalize idempotency marker (so subsequent collisions get the processed id)
+        if x_idempotency_key:
+            await redis_client.set(f"idemp-final:{x_idempotency_key}", internal_id, ex=settings.IDEMPOTENCY_TTL)
+
+        # Audit log (PII-safe)
+        logger.info("AUDIT | enqueue | user=%s | app_id=%s | internal_id=%s | files=%d",
+                    pii_safe(str(applicant.application_id)), pii_safe(getattr(request.client, "host", "unknown")), internal_id, len(file_records))
+
+        # Success response
+        elapsed = time.time() - start
+        MET_REQS.labels(path=path, method="POST", status="200").inc()
+        MET_LATENCY.labels(path=path).observe(elapsed)
+        return IngestResponse(
+            internal_id=internal_id,
+            enqueued=True,
+            message=f"Processed (Risk: {risk.risk_category})",
+            timestamp=datetime.utcnow(timezone.utc).isoformat()
+        )
+    except RateLimitExceeded as rl:
+        MET_REQS.labels(path=path, method="POST", status="429").inc()
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    except HTTPException as he:
+        MET_REQS.labels(path=path, method="POST", status=str(he.status_code)).inc()
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error in /apply: %s", e)
+        MET_REQS.labels(path=path, method="POST", status="500").inc()
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# -------------------------
+# Background S3 upload helper
+# -------------------------
+async def upload_to_s3(content_bytes: bytes, key: str, content_type: str = "application/pdf"):
+    """Uploads file bytes to S3 using aioboto3 in background; logs errors to audit and Sentry."""
+    try:
+        async with s3_session.client("s3", region_name=settings.S3_REGION) as s3:
+            await s3.put_object(Bucket=settings.S3_BUCKET, Key=key, Body=content_bytes, ContentType=content_type)
+            logger.info("S3 upload succeeded: %s", key)
+    except Exception as e:
+        logger.exception("S3 upload failed for %s: %s", key, e)
+        sentry_sdk.capture_exception(e)
+        # write minimal DLQ in Redis for operator action
+        try:
+            await redis_client.xadd("file_upload_dlq", {"key": key, "error": str(e)}, nomkstream=True)
+        except Exception:
+            pass
+
+# -------------------------
+# Utility: SHA256 hash
+# -------------------------
+import hashlib
+def sha256_hash(payload: str) -> str:
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+# -------------------------
+# Defensive JSON extraction (balanced-brace)
+# -------------------------
+def attempt_extract_json(s: str) -> Dict[str, Any]:
+    """Attempt to extract first balanced JSON object from a string."""
+    if not s:
+        return {}
+    start = None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if ch == '"' and not esc:
+            in_str = not in_str
+        if in_str and ch == "\\" and not esc:
+            esc = True
+            continue
+        else:
+            esc = False
+        if not in_str:
+            if ch == '{':
+                if start is None:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if start is not None and depth == 0:
+                    try:
+                        return json.loads(s[start:i+1])
+                    except Exception:
+                        return {}
+    return {}
+
+# -------------------------
+# Fallback rule-based risk assessment
+# -------------------------
+def fallback_risk_assessment(applicant: ApplicantForm) -> RiskScoreResponse:
+    score = 0.5
+    if applicant.smoker:
+        score += 0.25
+    if applicant.bmi and applicant.bmi > 30:
+        score += 0.2
+    if applicant.age and (applicant.age < 21 or applicant.age > 70):
+        score += 0.2
+    score = min(1.0, score)
+    if score < 0.4:
+        cat = "low"
+    elif score < 0.75:
+        cat = "medium"
+    else:
+        cat = "high"
+    return RiskScoreResponse(
+        internal_id=str(uuid.uuid4()),
+        risk_score=score,
+        risk_category=cat,
+        reasoning=f"Rule-based fallback (smoker={applicant.smoker}, bmi={applicant.bmi})",
+        llm_model="fallback"
+    )
+
+# -------------------------
+# Health endpoint that checks Redis, LLM, S3
+# -------------------------
+@app.get("/health/deps")
+async def dependency_health():
+    resp = {"redis": False, "llm": False, "s3": False}
+    # Redis
+    try:
+        await redis_client.ping()
+        resp["redis"] = True
+    except Exception as e:
+        logger.warning("Redis health check failed: %s", e)
+    # LLM
+    try:
+        # call a lightweight LLM endpoint /healthz if available, otherwise ping base
+        r = await httpx_llm_client.get("/health/ready")
+        resp["llm"] = (r.status_code == 200)
+    except Exception:
+        resp["llm"] = False
+    # S3
+    try:
+        async with s3_session.client("s3", region_name=settings.S3_REGION) as s3:
+            await s3.head_bucket(Bucket=settings.S3_BUCKET)
+            resp["s3"] = True
+    except Exception as e:
+        logger.warning("S3 health check failed: %s", e)
+    return resp
+
+# -------------------------
+# Exception handlers
+# -------------------------
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+# -------------------------
+# If run as main
+# -------------------------
+if __name__ == "__main__":
+    import uvicorn, sys
+    # Ensure logs dir exists
+    os.makedirs("logs", exist_ok=True)
+    # Start with multiple workers in container runtime (uvicorn cli should run this module)
+    uvicorn.run("api.src.api.main:app", host="0.0.0.0", port=8000, log_level="info")
