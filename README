@@ -1,0 +1,110 @@
+# AI Underwriting Prototype (PoC)
+
+A backend prototype for automated insurance underwriting using a local/open-source LLM as the "worker" instead of full manual review.
+
+**This is a proof-of-concept only** — not production-ready, not audited for compliance, and provided as-is for experimentation or inspiration.
+
+## Features
+
+- **FastAPI ingestion endpoint** (`/apply`): Accepts applicant form (JSON) + optional document uploads (PDFs)
+- Basic PDF validation (JavaScript/embedded file checks via PyMuPDF)
+- Background upload to S3
+- Risk assessment via local OpenAI-compatible LLM (e.g., Llama3) with rule-based fallback
+- Idempotency, rate limiting, circuit breaker, retries
+- Redis stream for async processing (worker with consumer group, DLQ, audit trail)
+- Prometheus metrics, structured logging (Loguru), Sentry hooks
+- Optional PII encryption (Fernet)
+- Separate PII deletion service with tamper-evident chained audit hashes
+
+## Tech Stack
+
+- Python 3.11+
+- FastAPI + Uvicorn
+- Redis (async)
+- httpx for LLM calls
+- aioboto3 for S3
+- Prometheus-client, Loguru, Sentry-sdk, OpenTelemetry
+- Optional: PyMuPDF (fitz), cryptography
+
+Requirements: see `requirements.txt`
+
+## Quick Start (Local Demo)
+
+### Prerequisites
+
+- Docker & docker-compose (easiest)
+- OR local Redis, Ollama/vLLM for LLM, AWS credentials for S3 (or mock)
+
+### Option 1: Docker Compose (Recommended)
+
+```bash
+git clone https://github.com/your-username/ai-underwriting-poc.git
+cd ai-underwriting-poc
+cp .env.example .env  # Edit with your values
+docker-compose up --build
+```
+
+Services:
+- `api`: http://localhost:8000
+- `worker`: background processing
+- `redis`: localhost:6379
+- `prometheus`: http://localhost:9090 (optional)
+
+### Option 2: Manual Local Run
+
+1. Start Redis: `docker run -p 6379:6379 redis`
+2. Start local LLM server (e.g., Ollama):
+   ```bash
+   ollama run llama3:8b
+   ```
+3. Install deps:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+4. Copy `.env.example` → `.env` and configure (especially `LLM_API_BASE_URL=http://localhost:11434/v1`)
+5. Run API: `uvicorn api.src.api.main:app --reload --port 8000`
+6. Run worker separately: `python worker/src/worker/main.py`
+
+## Example Request
+
+```bash
+curl -X POST http://localhost:8000/apply \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "form_json": "{\"age\": 35, \"bmi\": 25.5, \"smoker\": false}",
+    "documents": []  # or use -F for file uploads
+  }'
+```
+
+Response includes `internal_id`, risk score/category/reasoning from LLM or fallback.
+
+## Monitoring
+
+- Metrics: http://localhost:9100/metrics (API) + worker metrics
+- Logs: stdout or `logs/` directory
+
+## Limitations & Known Issues
+
+- No frontend/UI
+- No authentication beyond API key placeholder
+- LLM runs locally — needs GPU for decent speed
+- S3/Vault configs are placeholders
+- Not compliant-certified (bias, explainability, etc.)
+- Stress tests are basic
+
+## Contributing / Feedback
+
+Feel free to fork, improve, or ignore. Issues/PRs welcome but not required.  
+If you have questions or run into setup issues, reply to the original email.
+
+## License
+
+MIT License — use freely for internal experiments.
+
+---
+
+Created January 2026 by Akhil Asokan (Zurich Advisory Network UAE)
+No warranties — provided for learning and inspiration only.
