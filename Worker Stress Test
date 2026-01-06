@@ -1,191 +1,291 @@
-# tests/test_worker_stress_fixed.py
+# tests/test_worker_stress.py
 import asyncio
 import json
 import time
+from typing import Dict, Tuple
+
 import pytest
 import pytest_asyncio
 from fakeredis.aioredis import FakeRedis
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
+
 from worker.service import WorkerService
-from worker import metrics, audit_logger
+from worker import metrics
+from prometheus_client import CollectorRegistry, Counter
+
 
 # -------------------------
 # Constants
 # -------------------------
-TEST_CONFIGS = [
-    (1000, 5, 0.005),     # Small: 1k messages, 5 concurrency, 5ms latency
-    (5000, 10, 0.01)      # Medium: 5k messages, 10 concurrency, 10ms latency
-]
+STREAM_IN = "advice_in"
+STREAM_OUT = "advice_out"
+DLQ = "dlq"
 
-FULL_STRESS_MSGS = 50_000
-FULL_STRESS_CONCURRENCY = 20
-SIMULATED_LATENCY = 0.05
 BATCH_SIZE = 100
-THROUGHPUT_THRESHOLD = 500  # messages/sec for soft check
+THROUGHPUT_THRESHOLD_MSG_PER_SEC = 500  # Soft threshold – used only for xfail in load tests
+
 
 # -------------------------
 # Helpers
 # -------------------------
-async def clear_streams(redis_client):
+async def clear_streams(redis: FakeRedis) -> None:
     await asyncio.gather(
-        redis_client.delete("advice_in"),
-        redis_client.delete("advice_out"),
-        redis_client.delete("dlq")
+        redis.delete(STREAM_IN),
+        redis.delete(STREAM_OUT),
+        redis.delete(DLQ),
     )
 
-def make_payload(data):
-    return {b"payload": json.dumps(data).encode("utf-8")}
 
-def reset_worker_metrics():
-    """Safely reset metrics using public API."""
-    for m in [metrics.MET_MESSAGES_RECEIVED, metrics.MET_MESSAGES_PROCESSED, metrics.MET_MESSAGES_FAILED]:
-        current = m._value.get()
-        m.inc(-current)
+def reinitialize_metrics() -> None:
+    """Reinitialize all metrics with a fresh isolated registry for test independence."""
+    registry = CollectorRegistry()
+
+    metrics.MET_MESSAGES_RECEIVED = Counter(
+        "messages_received",
+        "Total messages received from input stream",
+        registry=registry,
+    )
+    metrics.MET_MESSAGES_PROCESSED = Counter(
+        "messages_processed",
+        "Total messages successfully processed",
+        registry=registry,
+    )
+    metrics.MET_MESSAGES_FAILED = Counter(
+        "messages_failed",
+        "Total messages that failed processing",
+        registry=registry,
+    )
+    # Update the global registry reference if your app uses default
+    metrics.REGISTRY = registry
+
+
+def get_metrics_snapshot() -> Dict[str, float]:
+    """Read current metric values using the official collect API."""
+    snapshot = {"received": 0.0, "processed": 0.0, "failed": 0.0}
+    for metric in metrics.REGISTRY.collect():
+        for sample in metric.samples:
+            if sample.name in snapshot:
+                snapshot[sample.name] = float(sample.value)
+    return snapshot
+
+
+async def preload_messages(redis: FakeRedis, total: int) -> None:
+    """Pre-load messages with bounded concurrency to prevent event loop overload."""
+    semaphore = asyncio.Semaphore(200)  # Safe concurrency limit even under large volumes
+
+    async def add_message(i: int):
+        async with semaphore:
+            payload = json.dumps({"user_id": i, "age": 20 + i % 50}).encode("utf-8")
+            await redis.xadd(STREAM_IN, {b"payload": payload})
+
+    tasks = [add_message(i) for i in range(total)]
+    # Process in chunks to avoid creating millions of tasks at once
+    for i in range(0, len(tasks), 1000):
+        await asyncio.gather(*tasks[i : i + 1000])
+
+
+async def verify_output_stream(redis: FakeRedis, expected_count: int, max_attempts: int = 20) -> None:
+    """Poll output stream until stable at expected count, with early exit."""
+    prev_count = -1
+    for _ in range(max_attempts):
+        entries = await redis.xrange(STREAM_OUT, "-", "+")
+        current_count = len(entries)
+        if current_count == expected_count and current_count == prev_count:
+            # Validate payload structure on all entries
+            for _, data in entries:
+                payload = json.loads(data[b"payload"].decode("utf-8"))
+                assert payload["decision"] == "APPROVED"
+                assert "risk_score" in payload
+                assert "reasoning" in payload
+            return
+        prev_count = current_count
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"Output stream did not stabilize at {expected_count} (last: {prev_count})")
+
 
 # -------------------------
 # Fixtures
 # -------------------------
-@pytest_asyncio.fixture(scope="module")
-async def redis_client():
-    r = FakeRedis()
-    yield r
+@pytest_asyncio.fixture
+async def redis() -> FakeRedis:
+    r = FakeRedis(decode_responses=False)
     await r.flushall()
+    yield r
     await r.close()
 
-@pytest_asyncio.fixture
-async def concurrency_lock():
-    return asyncio.Lock()
 
 @pytest_asyncio.fixture
-async def mock_llm():
-    class FakeResponse:
-        async def json(self):
-            await asyncio.sleep(0.0001)
-            return {"decision": "APPROVED", "risk_score": 0.1, "reasoning": "stress-safe"}
-    m = AsyncMock()
-    m.send.return_value = FakeResponse()
-    return m
+def mock_llm_client() -> MagicMock:
+    response_mock = AsyncMock()
+    response_mock.json = AsyncMock(
+        return_value={"decision": "APPROVED", "risk_score": 0.1, "reasoning": "stress-safe"}
+    )
+    client_mock = MagicMock()
+    client_mock.send = AsyncMock(return_value=response_mock)
+    return client_mock
+
 
 @pytest_asyncio.fixture
-async def mock_audit():
-    m = AsyncMock()
-    m.record = AsyncMock()
-    return m
+def mock_audit() -> AsyncMock:
+    mock = AsyncMock()
+    mock.record = AsyncMock()
+    return mock
+
 
 @pytest_asyncio.fixture
-async def worker(redis_client, mock_llm, mock_audit, request):
-    reset_worker_metrics()
-    param = getattr(request, 'param', None)
-    concurrency_limit = FULL_STRESS_CONCURRENCY
-    if isinstance(param, (tuple, list)):
-        concurrency_limit = param[1]
-
+async def worker_service(
+    redis: FakeRedis,
+    mock_llm_client: MagicMock,
+    mock_audit: AsyncMock,
+) -> WorkerService:
+    reinitialize_metrics()
     svc = WorkerService(
-        redis=redis_client,
-        llm_client=mock_llm,
+        redis=redis,
+        llm_client=mock_llm_client,
         audit=mock_audit,
         batch_size=BATCH_SIZE,
-        concurrency=concurrency_limit,
-        semaphore=asyncio.Semaphore(concurrency_limit),
+        concurrency=20,
+        semaphore=asyncio.Semaphore(20),
         shutdown_event=asyncio.Event(),
         llm_timeout=5,
-        max_retries=3
+        max_retries=3,
     )
     yield svc
 
+
+@pytest_asyncio.fixture
+def concurrency_tracker() -> Tuple[asyncio.Lock, dict]:
+    tracker = {"current": 0, "peak": 0}
+    lock = asyncio.Lock()
+    return lock, tracker
+
+
 # -------------------------
-# Core Functions
+# Core runner
 # -------------------------
-async def preload_messages(redis, stream_name, total_messages):
-    sem_limit = min(500, max(50, total_messages // 100))
-    sem = asyncio.Semaphore(sem_limit)
-
-    async def safe_xadd(i):
-        async with sem:
-            await redis.xadd(stream_name, make_payload({"user_id": i, "age": 20 + i % 50}))
-
-    await asyncio.gather(*[safe_xadd(i) for i in range(total_messages)])
-
-async def run_processing_loop(worker_svc, concurrency_lock, total_messages, concurrency_limit, simulated_latency):
-    active = {"current": 0, "max": 0}
-    original_send = worker_svc.llm_client.send
+async def run_worker_and_verify(
+    worker: WorkerService,
+    total_messages: int,
+    concurrency_limit: int,
+    simulated_latency: float,
+    concurrency_tracker: Tuple[asyncio.Lock, dict],
+    mock_audit: AsyncMock,
+    max_poll_attempts: int = 20,
+) -> float:
+    lock, tracker = concurrency_tracker
+    original_send = worker.llm_client.send
 
     async def instrumented_send(*args, **kwargs):
-        async with concurrency_lock:
-            active["current"] += 1
-            active["max"] = max(active["max"], active["current"])
+        async with lock:
+            tracker["current"] += 1
+            tracker["peak"] = max(tracker["peak"], tracker["current"])
         await asyncio.sleep(simulated_latency)
-        async with concurrency_lock:
-            active["current"] -= 1
+        async with lock:
+            tracker["current"] -= 1
         return await original_send(*args, **kwargs)
 
-    worker_svc.llm_client.send.side_effect = instrumented_send
+    worker.llm_client.send.side_effect = instrumented_send
 
-    total_batches = 0
-    start_time = time.time()
-
-    async def process_batches():
-        nonlocal total_batches
-        while True:
-            batch = await worker_svc._fetch_batch("advice_in")
-            if not batch:
-                break
-            metrics.MET_MESSAGES_RECEIVED.inc(len(batch))
-            await worker_svc._process_batch("advice_in", batch)
-            await asyncio.sleep(0)
-            total_batches += 1
+    start_time = time.perf_counter()
 
     try:
-        await asyncio.wait_for(process_batches(), timeout=300)
+        await asyncio.wait_for(worker.drain_stream(STREAM_IN), timeout=300)
     except asyncio.TimeoutError:
-        pytest.fail("Processing loop timed out after 300s")
+        snapshot = get_metrics_snapshot()
+        raise pytest.fail(
+            f"drain_stream timed out after 300s. "
+            f"Metrics: {snapshot} | Peak concurrency: {tracker['peak']}"
+        )
 
-    total_duration = time.time() - start_time
-    throughput = total_messages / total_duration if total_duration > 0 else 0
+    duration = time.perf_counter() - start_time
+    throughput = total_messages / duration if duration > 0 else 0
 
-    # Concurrency check
-    assert active["max"] <= concurrency_limit, f"Max concurrency {active['max']} exceeded {concurrency_limit}"
+    # Core assertions
+    assert tracker["peak"] <= concurrency_limit
 
-    # Throughput soft check
-    if total_messages > 10000 and throughput < THROUGHPUT_THRESHOLD:
-        pytest.xfail(f"Throughput {throughput:.2f} < {THROUGHPUT_THRESHOLD} msg/sec for large run")
+    snapshot = get_metrics_snapshot()
+    assert snapshot["received"] == total_messages
+    assert snapshot["processed"] == total_messages
+    assert snapshot["failed"] == 0
 
-    # Metrics check
-    assert metrics.MET_MESSAGES_RECEIVED._value.get() == total_messages
-    assert metrics.MET_MESSAGES_PROCESSED._value.get() == total_messages
-    assert metrics.MET_MESSAGES_FAILED._value.get() == 0
+    await verify_output_stream(worker.redis, total_messages, max_poll_attempts)
 
-    # Output check
-    out_entries = []
-    for _ in range(10):
-        out_entries = await worker_svc.redis.xrange("advice_out", "-", "+")
-        if len(out_entries) == total_messages:
-            break
-        await asyncio.sleep(0.5)
-    assert len(out_entries) == total_messages
+    # Audit: count + sample content validation
+    assert mock_audit.record.call_count == total_messages
+    if total_messages > 0:
+        sample_call = mock_audit.record.call_args_list[0]
+        event_data = sample_call.kwargs.get("event", {})
+        assert "user_id" in str(event_data)  # Loose but ensures key propagation
 
-    # Payload validation
-    for _, data in out_entries:
-        payload = json.loads(data[b"payload"].decode("utf-8"))
-        assert payload["decision"] == "APPROVED"
-        assert "risk_score" in payload
-        assert "reasoning" in payload
+    # Soft throughput check only on large runs
+    if total_messages > 10_000 and throughput < THROUGHPUT_THRESHOLD_MSG_PER_SEC:
+        pytest.xfail(f"Throughput {throughput:.2f} msg/s below soft threshold (host-dependent)")
+
+    return throughput
+
 
 # -------------------------
-# Test Cases
+# Fast correctness tests
 # -------------------------
-@pytest.mark.parametrize("worker,total_messages,concurrency,simulated_latency", TEST_CONFIGS, indirect=["worker"])
+@pytest.mark.parametrize(
+    "total_messages, concurrency_limit, simulated_latency, max_poll",
+    [
+        (500, 5, 0.001, 10),
+        (1_000, 10, 0.005, 12),
+        (2_000, 15, 0.01, 15),
+    ],
+)
 @pytest.mark.asyncio
-async def test_concurrency_limits(worker, redis_client, concurrency_lock, total_messages, concurrency, simulated_latency):
-    await clear_streams(redis_client)
-    await preload_messages(redis_client, "advice_in", total_messages)
-    await run_processing_loop(worker, concurrency_lock, total_messages, concurrency, simulated_latency)
+async def test_worker_correctness_and_concurrency(
+    worker_service: WorkerService,
+    redis: FakeRedis,
+    concurrency_tracker: Tuple[asyncio.Lock, dict],
+    mock_audit: AsyncMock,
+    total_messages: int,
+    concurrency_limit: int,
+    simulated_latency: float,
+    max_poll: int,
+):
+    worker_service.concurrency = concurrency_limit
+    worker_service.semaphore = asyncio.Semaphore(concurrency_limit)
 
+    await clear_streams(redis)
+    await preload_messages(redis, total_messages)
+
+    await run_worker_and_verify(
+        worker_service,
+        total_messages,
+        concurrency_limit,
+        simulated_latency,
+        concurrency_tracker,
+        mock_audit,
+        max_poll_attempts=max_poll,
+    )
+
+
+# -------------------------
+# Slow load test
+# -------------------------
+@pytest.mark.slow
 @pytest.mark.asyncio
-async def test_high_volume_throughput(worker, redis_client, concurrency_lock):
-    # Explicitly reset worker for full stress
-    worker.concurrency = FULL_STRESS_CONCURRENCY
-    worker.semaphore = asyncio.Semaphore(FULL_STRESS_CONCURRENCY)
-    await clear_streams(redis_client)
-    await preload_messages(redis_client, "advice_in", FULL_STRESS_MSGS)
-    await run_processing_loop(worker, concurrency_lock, FULL_STRESS_MSGS, FULL_STRESS_CONCURRENCY, SIMULATED_LATENCY)
+async def test_worker_high_volume_load(
+    worker_service: WorkerService,
+    redis: FakeRedis,
+    concurrency_tracker: Tuple[asyncio.Lock, dict],
+    mock_audit: AsyncMock,
+):
+    total_messages = 50_000
+    concurrency_limit = 20
+    simulated_latency = 0.05
+
+    await clear_streams(redis)
+    await preload_messages(redis, total_messages)
+
+    await run_worker_and_verify(
+        worker_service,
+        total_messages,
+        concurrency_limit,
+        simulated_latency,
+        concurrency_tracker,
+        mock_audit,
+    )
