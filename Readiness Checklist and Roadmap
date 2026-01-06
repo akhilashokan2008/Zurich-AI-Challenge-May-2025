@@ -1,0 +1,64 @@
+readiness checklist and roadmap** for evolving the AI underwriting PoC into a minimal viable internal tool (MVP) suitable for sandbox or controlled pilot testing.
+
+***
+
+### Phase 1: Technical Readiness
+
+**Goal:** Ensure the foundation is stable, testable, and safe for internal data.
+
+**Checklist**
+- [ ] Conduct a code security scan (`bandit`, `pip-audit`, `safety check`).  
+- [ ] Add unit and integration tests for the API, Redis pipeline, and LLM interface.  
+- [ ] Introduce environment separation (`.env.dev`, `.env.staging`, `.env.prod`).  
+- [ ] Replace API key placeholder with token-based authentication (JWT or OAuth2).  
+- [ ] Hook Prometheus and Sentry dashboards into persistent storage for metrics.  
+- [ ] Set up automated Docker build and deployment pipeline (GitHub Actions or GitLab CI).  
+
+**Outcome:** A stable backend prototype that can safely run in an internal sandbox.
+
+***
+
+### Phase 2: AI & Decision Quality
+
+**Goal:** Improve reliability and traceability of model-driven scoring.
+
+**Checklist**
+- [ ] Add explainability by structuring LLM output (e.g., JSON with “reasoning,” “rules triggered,” “confidence”).  
+- [ ] Compare LLM results vs rule-based baseline on sample cases.  
+- [ ] Create a small in-house test dataset for accuracy checks.  
+- [ ] Log model version, prompt template, and parameter settings for each case.  
+- [ ] Add risk threshold tuning and human validation loop before model decisions are stored.
+
+**Outcome:** Transparent and auditable model output ready for limited human-in-loop testing.
+
+***
+
+### Phase 3: Compliance & Data Protection
+
+**Goal:** Bring the prototype closer to internal standards and privacy expectations.
+
+**Checklist**
+- [ ] Enable PII encryption by default; securely manage keys (e.g., AWS KMS or Vault).  
+- [ ] Add consent tracking and configurable data retention window.  
+- [ ] Document data flow and storage for privacy review.  
+- [ ] Include bias monitoring (basic demographic fairness checks if applicable).  
+- [ ] Add versioned audit hash verification and secure access logs.
+
+**Outcome:** Prototype becomes compliant-enough for internal non-production experimentation.
+
+***
+
+### Phase 4: Operationalization & Feedback Loop
+
+**Goal:** Turn the prototype into a usable internal research tool.
+
+**Checklist**
+- [ ] Build a lightweight reviewer UI (React/Vue dashboard or Streamlit review panel).  
+- [ ] Implement case review status (Pending → Reviewed → Approved/Rejected).  
+- [ ] Track user feedback for active learning or prompt refinement.  
+- [ ] Introduce role-based access (underwriter, supervisor, admin).  
+- [ ] Run early user sessions and document qualitative feedback.
+
+**Outcome:** Internal MVP demonstrating workflows similar to a live underwriting system, but fully contained within controlled, internal boundaries.
+
+***
