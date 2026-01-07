@@ -1,361 +1,269 @@
-# ========================================================================
-# Policy LLM Service Monitoring - v1.2.0-next
-# ========================================================================
-
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
 metadata:
-  name: policy-llm-monitoring-v1-2-0-next
-  namespace: monitoring
+  name: policy-llm-recording-rules
   labels:
-    version: v1.2.0-next
+    service: policy-llm
+    team: ml-infra
+    tier: enterprise
+spec:
+  groups:
+    - name: policy-llm.slo.recordings
+      rules:
+        # Fast error rate (≈1% error budget burn over 5m)
+        - record: policy_llm:http_error_rate:5m
+          expr: |
+            sum by (model) (
+              rate(http_requests_total{service="policy-llm",status=~"5.."}[5m])
+            )
+            /
+            clamp_min(
+              sum by (model) (
+                rate(http_requests_total{service="policy-llm"}[5m])
+              ),
+              1
+            )
 
-# ========================================================================
-# Prometheus Alert Rules
-# ========================================================================
+        # Slow error rate (sustained burn confirmation)
+        - record: policy_llm:http_error_rate:1h
+          expr: |
+            sum by (model) (
+              rate(http_requests_total{service="policy-llm",status=~"5.."}[1h])
+            )
+            /
+            clamp_min(
+              sum by (model) (
+                rate(http_requests_total{service="policy-llm"}[1h])
+              ),
+              1
+            )
 
-prometheusRules:
-  apiVersion: monitoring.coreos.com/v1
-  kind: PrometheusRule
-  metadata:
-    name: policy-llm-alerts-v1-2-0-next
-    namespace: monitoring
-  spec:
-    groups:
-      - name: policy-llm.rules
-        rules:
+        # Token latency SLO — P95 TPOT
+        - record: policy_llm:tpot_p95:2m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, model) (
+                rate(llm_tpot_seconds_bucket{service="policy-llm"}[2m])
+              )
+            )
 
-          # High API latency (95th percentile)
-          - alert: HighAPIInferenceLatency
-            expr: histogram_quantile(0.95, sum by (le, endpoint, service) (rate(policy_llm_api_latency_seconds_bucket{namespace=~"prod|staging"}[5m]))) > 0.5
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: ml-ops
-            annotations:
-              summary: High inference latency
-              description: "95th percentile API latency exceeded 500ms for {{ $labels.endpoint }}"
+    - name: policy-llm.saturation.recordings
+      rules:
+        # GPU utilization (consistent labels)
+        - record: policy_llm:gpu_utilization:avg
+          expr: |
+            avg by (model, node) (
+              gpu_utilization{service="policy-llm"}
+            )
 
-          # High API error rate
-          - alert: HighAPIErrorRate
-            expr: (sum(rate(http_requests_total{namespace=~"prod|staging", service="policy-llm", status=~"5.."}[5m])) by (service)) / clamp_min(sum(rate(http_requests_total{namespace=~"prod|staging", service="policy-llm"}[5m])) by (service),1) > 0.05
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: ml-ops
-            annotations:
-              summary: High API error rate
-              description: "More than 5% of API requests failing in last 5 minutes"
+        # Queue growth rate (preferred saturation signal)
+        - record: policy_llm:queue_growth_rate:5m
+          expr: |
+            rate(queue_depth{service="policy-llm"}[5m])
 
-          # Function slowdown
-          - alert: FunctionSlowdown
-            expr: histogram_quantile(0.95, sum by (le, function, service) (rate(function_latency_seconds_bucket{namespace=~"prod|staging"}[5m]))) > 2
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: ml-ops
-            annotations:
-              summary: Function slowdown
-              description: "95th percentile execution time of function {{ $labels.function }} exceeded 2s"
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: policy-llm-alerts
+  labels:
+    service: policy-llm
+    team: ml-infra
+spec:
+  groups:
+    - name: policy-llm.performance
+      rules:
+        - alert: LLMTokenGenerationSlowdown
+          # SLO: P95 TPOT > 40ms for 3m
+          expr: policy_llm:tpot_p95:2m > 0.04
+          for: 3m
+          labels:
+            service: policy-llm
+            severity: warning
+            remediation_plan: scale-inference-workers
+            pager_scope: ml
+            sla_level: tier2
+          annotations:
+            summary: "TPOT SLO violation"
+            description: "P95 token generation latency exceeds 40ms."
 
-          # LLM Offline & abnormalities
-          - alert: LLMOffline
-            expr: sum(policy_llm_up{namespace=~"prod|staging"}) by (service) == 0
-            for: 3m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: ml-ops
-            annotations:
-              summary: LLM service offline
-              description: "LLM service is not responding"
+        - alert: LLMErrorBudgetBurningFast
+          # ≈1% error budget burn over 5m
+          expr: policy_llm:http_error_rate:5m > 0.01
+          for: 2m
+          labels:
+            service: policy-llm
+            severity: critical
+            remediation_plan: region-failover
+            pager_scope: ml
+            sla_level: tier1
+          annotations:
+            summary: "Fast error budget burn detected"
 
-          - alert: LLMAbnormalities
-            expr: increase(llm_abnormalities_total{namespace=~"prod|staging"}[5m]) > 0
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: ml-ops
-            annotations:
-              summary: LLM abnormalities
-              description: "Detected {{ $value }} LLM anomalies in the last 5 minutes"
+        - alert: LLMErrorBudgetBurningSlow
+          expr: policy_llm:http_error_rate:1h > 0.005
+          for: 10m
+          labels:
+            service: policy-llm
+            severity: critical
+            pager_scope: ml
+            sla_level: tier1
+          annotations:
+            summary: "Sustained error budget burn"
 
-          # Batch queue backlog
-          - alert: BatchQueueLengthHigh
-            expr: batch_queue_length{namespace=~"prod|staging"} > 50
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-            annotations:
-              summary: Batch queue backlog
-              description: "Pending batch jobs exceed 50"
+        - alert: LLMSaturationDetected
+          # Queue growth indicates saturation earlier than raw GPU %
+          expr: policy_llm:queue_growth_rate:5m > 50
+          for: 5m
+          labels:
+            service: policy-llm
+            severity: warning
+            pager_scope: ml
+          annotations:
+            summary: "Inference queue growing abnormally"
 
-          # Redis / Kafka
-          - alert: RedisUnavailable
-            expr: sum(redis_up{namespace=~"prod|staging"}) by (service) == 0
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: Redis offline
-              description: "Redis service unavailable"
+    - name: policy-llm.security
+      rules:
+        - alert: SecurityAgentHighRiskSignal
+          expr: |
+            avg_over_time(
+              siem_threat_confidence_score{service="policy-llm"}[5m]
+            ) > 0.85
+            and
+            rate(
+              http_requests_total{
+                service="policy-llm",
+                status=~"5.."
+              }[5m]
+            ) > 0.01
+          for: 5m
+          labels:
+            service: policy-llm
+            severity: critical
+            remediation_plan: security-mitigation
+            pager_scope: security
+            sla_level: tier1
+          annotations:
+            summary: "High-confidence security threat with server errors"
 
-          - alert: KafkaUnavailable
-            expr: sum(kafka_broker_up{namespace=~"prod|staging"}) by (service) == 0
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: Kafka offline
-              description: "Kafka broker unavailable"
+apiVersion: automation.enterprise.io/v1
+kind: RemediationPlan
+metadata:
+  name: scale-inference-workers
+  labels:
+    service: policy-llm
+    team: ml-infra
+spec:
+  triggerAlert: LLMTokenGenerationSlowdown
+  safety:
+    maxActionsPerDay: 3
+    failOpen: true
+    fallbackAction: NotifyOnCall
+  audit:
+    emitEvents: true
+  actions:
+    - step: 1
+      action: VerticalPodAutoscaling
+      target: deployment/inference-workers
+      parameters:
+        increment: 2
+        max: 20
+      cooldown: 10m
 
-          # Internet / Electricity
-          - alert: InternetOffline
-            expr: sum(internet_up{namespace=~"prod|staging"}) by (service) == 0
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: Internet offline
-              description: "Internet connectivity down"
+apiVersion: automation.enterprise.io/v1
+kind: RemediationPlan
+metadata:
+  name: region-failover
+  labels:
+    service: policy-llm
+    team: ml-infra
+spec:
+  triggerAlert: LLMErrorBudgetBurningFast
+  safety:
+    maxActionsPerDay: 1
+    failOpen: true
+    fallbackAction: FreezeTrafficShift
+  audit:
+    emitEvents: true
+  actions:
+    - step: 1
+      action: TrafficShift
+      provider: CloudMesh
+      target: region-us-east-2
+      parameters:
+        weight: 10
+      cooldown: 10m
 
-          - alert: ElectricityOffline
-            expr: sum(electricity_up{namespace=~"prod|staging"}) by (service) == 0
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: Electricity offline
-              description: "Power outage detected"
+apiVersion: automation.enterprise.io/v1
+kind: RemediationPlan
+metadata:
+  name: security-mitigation
+  labels:
+    service: policy-llm
+    team: security
+spec:
+  triggerAlert: SecurityAgentHighRiskSignal
+  safety:
+    maxActionsPerDay: 2
+    failOpen: false
+  audit:
+    emitEvents: true
+  actions:
+    - step: 1
+      action: EnableAggressiveWAFRateLimit
+      cooldown: 10m
+    - step: 2
+      action: RotateServiceMeshCerts
+      cooldown: 20m
 
-          # Security
-          - alert: CyberAttackDetected
-            expr: increase(cyber_attack_detected_total{namespace=~"prod|staging"}[5m]) > 0
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: security
-            annotations:
-              summary: Possible cyber attack
-              description: "New cyber attacks detected in last 5 minutes"
+resource "prometheus_rule" "policy_llm_alerts" {
+  group_name = "policy-llm-v2"
 
-          - alert: BreakInAttempt
-            expr: increase(break_in_attempt_total{namespace=~"prod|staging"}[5m]) > 0
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: security
-            annotations:
-              summary: Unauthorized access attempt
-              description: "Break-in attempts detected in last 5 minutes"
+  rule {
+    alert = "LLMTokenGenerationSlowdown"
+    expr  = "policy_llm:tpot_p95:2m > 0.04"
+    for   = "3m"
+    labels = {
+      service  = "policy-llm"
+      severity = "warning"
+      team     = "ml-infra"
+    }
+  }
+}
 
-          # Blackbox Exporter
-          - alert: BlackboxHTTPDown
-            expr: probe_http_status_code{module="http_2xx", namespace=~"prod|staging"} != 200
-            for: 5m
-            labels:
-              severity: critical
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: Blackbox HTTP failure
-              description: "HTTP probe returned non-200 status"
+local grafana = import 'github.com/grafonnet/grafonnet-lib/grafonnet/grafana.libsonnet';
 
-          - alert: BlackboxSSLExpiry
-            expr: probe_ssl_earliest_cert_expiry{module="http_2xx", namespace=~"prod|staging"} - time() < 86400*7
-            for: 0m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: SSL certificate expiry
-              description: "SSL certificate expires in less than 7 days"
-
-          - alert: BlackboxDNSLatencyHigh
-            expr: probe_dns_lookup_time_seconds{module="http_2xx", namespace=~"prod|staging"} > 0.5
-            for: 5m
-            labels:
-              severity: warning
-              service: policy-llm
-              team: infra
-            annotations:
-              summary: DNS resolution latency
-              description: "DNS lookup time exceeded 500ms"
-
-# ========================================================================
-# Grafana Dashboard JSON
-# ========================================================================
-
-grafanaDashboard:
-  id: null
-  title: "Policy LLM Service Monitoring - v1.2.0-next"
-  uid: "policy-llm-dashboard-v1-2-0-next"
-  timezone: "browser"
-  panels:
-    - type: "graph"
-      title: "API Latency (95th percentile)"
-      targets:
-        - expr: histogram_quantile(0.95, sum by (le, endpoint, service) (rate(policy_llm_api_latency_seconds_bucket{namespace=~"prod|staging"}[5m])))
-          legendFormat: "{{service}}:{{endpoint}}"
-          refId: "A"
-      thresholds:
-        - value: 0.5
-          colorMode: "critical"
-          line: true
-    - type: "graph"
-      title: "Function Latency (95th percentile)"
-      targets:
-        - expr: histogram_quantile(0.95, sum by (le, function, service) (rate(function_latency_seconds_bucket{namespace=~"prod|staging"}[5m])))
-          legendFormat: "{{service}}:{{function}}"
-          refId: "B"
-      thresholds:
-        - value: 2
-          colorMode: "warning"
-          line: true
-    - type: "stat"
-      title: "LLM Status & Abnormalities"
-      targets:
-        - expr: sum(policy_llm_up{namespace=~"prod|staging"}) by (service)
-          legendFormat: "LLM Up"
-          refId: "C"
-        - expr: increase(llm_abnormalities_total{namespace=~"prod|staging"}[5m])
-          legendFormat: "Abnormalities"
-          refId: "D"
-    - type: "graph"
-      title: "Batch Queue Length"
-      targets:
-        - expr: batch_queue_length{namespace=~"prod|staging"}
-          legendFormat: "Pending Jobs"
-          refId: "E"
-      thresholds:
-        - value: 50
-          colorMode: "warning"
-          line: true
-    - type: "stat"
-      title: "Redis & Kafka Status"
-      targets:
-        - expr: sum(redis_up{namespace=~"prod|staging"}) by (service)
-          legendFormat: "Redis Up"
-          refId: "F"
-        - expr: sum(kafka_broker_up{namespace=~"prod|staging"}) by (service)
-          legendFormat: "Kafka Up"
-          refId: "G"
-    - type: "stat"
-      title: "Internet & Electricity"
-      targets:
-        - expr: sum(internet_up{namespace=~"prod|staging"}) by (service)
-          legendFormat: "Internet Up"
-          refId: "H"
-        - expr: sum(electricity_up{namespace=~"prod|staging"}) by (service)
-          legendFormat: "Power Up"
-          refId: "I"
-    - type: "graph"
-      title: "Security Events"
-      targets:
-        - expr: increase(cyber_attack_detected_total{namespace=~"prod|staging"}[5m])
-          legendFormat: "Cyber Attacks"
-          refId: "J"
-        - expr: increase(break_in_attempt_total{namespace=~"prod|staging"}[5m])
-          legendFormat: "Break-in Attempts"
-          refId: "K"
-
-# ========================================================================
-# Runbooks / Actionable Mapping
-# ========================================================================
-
-runbooks:
-  HighAPIInferenceLatency:
-    - step: "Confirm alert repeatability"
-    - step: "Check API latency metrics per endpoint and service"
-    - step: "Inspect dependent services (Redis, Kafka, downstream APIs)"
-    - step: "Scale pods or inference workers if needed"
-    - step: "Escalate to ML-Ops if persists"
-    - escalation_policy: "Page ML-Ops L2 if unresolved after 15 minutes"
-
-  HighAPIErrorRate:
-    - step: "Verify alert repeatability"
-    - step: "Check HTTP 5xx/4xx logs per service"
-    - step: "Check Redis/Kafka connectivity"
-    - step: "Investigate LLM endpoint errors"
-    - escalation_policy: "Page ML-Ops L2 if error ratio remains above threshold"
-
-  FunctionSlowdown:
-    - step: "Verify alert repeatability"
-    - step: "Identify function via 'function' label"
-    - step: "Inspect function metrics and bottlenecks"
-    - step: "Review recent deployments or changes"
-    - step: "Scale resources if required"
-    - escalation_policy: "Page ML-Ops L2 if slowdown persists"
-
-  LLMOffline:
-    - step: "Verify alert repeatability"
-    - step: "Check LLM pods and logs"
-    - step: "Restart LLM if necessary"
-    - step: "Notify ML-Ops team"
-
-  LLMAbnormalities:
-    - step: "Confirm increase in abnormalities"
-    - step: "Check LLM outputs and performance"
-    - step: "Restart LLM if necessary"
-    - step: "Escalate to ML-Ops team"
-
-  RedisUnavailable:
-    - step: "Check Redis pod health and logs"
-    - step: "Test network connectivity"
-    - step: "Failover to backup Redis if configured"
-    - escalation_policy: "Notify Infra team"
-
-  KafkaUnavailable:
-    - step: "Check Kafka broker and connectivity"
-    - step: "Inspect producer/consumer failures"
-    - escalation_policy: "Notify Infra team"
-
-  InternetOffline:
-    - step: "Verify alert repeatability"
-    - step: "Check network provider and routing"
-    - escalation_policy: "Notify Infra team"
-
-  ElectricityOffline:
-    - step: "Verify alert repeatability"
-    - step: "Check UPS and power supply"
-    - escalation_policy: "Notify Infra team"
-
-  CyberAttackDetected:
-    - step: "Confirm new events"
-    - step: "Investigate source IPs and attack vector"
-    - step: "Block malicious actors if needed"
-    - escalation_policy: "Page Security team L2 immediately"
-
-  BreakInAttempt:
-    - step: "Check authentication logs"
-    - step: "Investigate compromised accounts"
-    - escalation_policy: "Page Security team L2 immediately"
-
-  BlackboxHTTPDown:
-    - step: "Verify HTTP probe"
-    - step: "Check service endpoint"
-    - escalation_policy: "Notify Infra team"
-
-  BlackboxSSLExpiry:
-    - step: "Check SSL certificate expiry"
-    - step: "Rotate certificate if necessary"
-    - escalation_policy: "Notify Infra team"
-
-  BlackboxDNSLatencyHigh:
-    - step: "Check DNS server and probe configuration"
-    - step: "Investigate resolution delays"
-    - escalation_policy: "Notify Infra team"
+grafana.dashboard.new(
+  title='Policy LLM — SLO & Saturation',
+  uid=std.extVar('DASHBOARD_UID'),
+  editable=false,
+  schemaVersion=37,
+)
+.addPanel(
+  grafana.timeSeries.new(
+    title='TPOT P95 (SLO: 40ms)',
+    unit='s',
+  )
+  .addTarget(
+    grafana.prometheus.target('policy_llm:tpot_p95:2m')
+  )
+)
+.addPanel(
+  grafana.timeSeries.new(
+    title='Error Budget Burn (Fast vs Slow)',
+  )
+  .addTarget(
+    grafana.prometheus.target('policy_llm:http_error_rate:5m')
+  )
+  .addTarget(
+    grafana.prometheus.target('policy_llm:http_error_rate:1h')
+  )
+)
+.addPanel(
+  grafana.timeSeries.new(
+    title='Inference Queue Growth Rate',
+  )
+  .addTarget(
+    grafana.prometheus.target('policy_llm:queue_growth_rate:5m')
+  )
+)
