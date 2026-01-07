@@ -1,0 +1,5 @@
+Client → Set F (ingestion API) → sync LLM call (Set B) + enqueue Redis Stream
+                                            ↓
+                                      Set A (async worker) → file processing → LLM (Set B) → output stream
+                                            ↓
+Set D (SLOs/alerts/remediation) monitors B+F+A    Set E (PII deletion) scrubs data on request
