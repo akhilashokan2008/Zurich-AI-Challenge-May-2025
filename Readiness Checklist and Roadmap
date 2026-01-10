@@ -1,64 +1,275 @@
-readiness checklist and roadmap** for evolving the AI underwriting PoC into a minimal viable internal tool (MVP) suitable for sandbox or controlled pilot testing.
+Detailed readiness checklist and roadmap for deploying and operating the full AI Underwriter Platform (all code sets 3–5 combined). 
 
-***
+This is structured by phases: Pre-Deployment, Deployment, Post-Deployment / Operations, and Continuous Improvement.
 
-### Phase 1: Technical Readiness
 
-**Goal:** Ensure the foundation is stable, testable, and safe for internal data.
+---
 
-**Checklist**
-- [ ] Conduct a code security scan (`bandit`, `pip-audit`, `safety check`).  
-- [ ] Add unit and integration tests for the API, Redis pipeline, and LLM interface.  
-- [ ] Introduce environment separation (`.env.dev`, `.env.staging`, `.env.prod`).  
-- [ ] Replace API key placeholder with token-based authentication (JWT or OAuth2).  
-- [ ] Hook Prometheus and Sentry dashboards into persistent storage for metrics.  
-- [ ] Set up automated Docker build and deployment pipeline (GitHub Actions or GitLab CI).  
+1. Pre-Deployment Readiness Checklist
 
-**Outcome:** A stable backend prototype that can safely run in an internal sandbox.
+Infrastructure
 
-***
+[ ] Kubernetes cluster or VM provisioning completed (CPU, GPU for LLM inference).
 
-### Phase 2: AI & Decision Quality
+[ ] Storage configured: S3 bucket / object storage for document uploads.
 
-**Goal:** Improve reliability and traceability of model-driven scoring.
+[ ] Redis cluster deployed and tested.
 
-**Checklist**
-- [ ] Add explainability by structuring LLM output (e.g., JSON with “reasoning,” “rules triggered,” “confidence”).  
-- [ ] Compare LLM results vs rule-based baseline on sample cases.  
-- [ ] Create a small in-house test dataset for accuracy checks.  
-- [ ] Log model version, prompt template, and parameter settings for each case.  
-- [ ] Add risk threshold tuning and human validation loop before model decisions are stored.
+[ ] PostgreSQL / AsyncPG-compatible DB deployed and accessible.
 
-**Outcome:** Transparent and auditable model output ready for limited human-in-loop testing.
+[ ] Vault deployed and secrets paths configured (pii/db, pii/jwt).
 
-***
+[ ] Networking and firewall rules allow API, LLM, Redis, DB, and Vault connectivity.
 
-### Phase 3: Compliance & Data Protection
 
-**Goal:** Bring the prototype closer to internal standards and privacy expectations.
+Configuration
 
-**Checklist**
-- [ ] Enable PII encryption by default; securely manage keys (e.g., AWS KMS or Vault).  
-- [ ] Add consent tracking and configurable data retention window.  
-- [ ] Document data flow and storage for privacy review.  
-- [ ] Include bias monitoring (basic demographic fairness checks if applicable).  
-- [ ] Add versioned audit hash verification and secure access logs.
+[ ] .env or ConfigMaps/Secrets populated with production values.
 
-**Outcome:** Prototype becomes compliant-enough for internal non-production experimentation.
+[ ] JWT secret and Fernet key generated and validated.
 
-***
+[ ] API keys generated for ingestion endpoints.
 
-### Phase 4: Operationalization & Feedback Loop
+[ ] Prometheus and Grafana endpoints configured.
 
-**Goal:** Turn the prototype into a usable internal research tool.
+[ ] LLM endpoints (local or remote) validated for connectivity.
 
-**Checklist**
-- [ ] Build a lightweight reviewer UI (React/Vue dashboard or Streamlit review panel).  
-- [ ] Implement case review status (Pending → Reviewed → Approved/Rejected).  
-- [ ] Track user feedback for active learning or prompt refinement.  
-- [ ] Introduce role-based access (underwriter, supervisor, admin).  
-- [ ] Run early user sessions and document qualitative feedback.
 
-**Outcome:** Internal MVP demonstrating workflows similar to a live underwriting system, but fully contained within controlled, internal boundaries.
+Code / Application
 
-***
+[ ] All code sets pulled and versioned:
+
+Code Set 3: Policy LLM (SLOs, alerting, PrometheusRules, RemediationPlans).
+
+Code Set 4: PII Deletion API + Worker.
+
+Code Set 5: Enterprise API ingestion service.
+
+
+[ ] Dependencies installed and tested in a virtual environment or container.
+
+[ ] Docker images built for each service with health endpoints exposed.
+
+[ ] Static code analysis, security scanning, and linting completed.
+
+
+Observability
+
+[ ] Prometheus rules loaded and tested.
+
+[ ] Grafana dashboards deployed for:
+
+LLM TPOT latency
+
+Error budget (fast/slow)
+
+Queue growth & GPU utilization
+
+Worker success/failure/DLQ
+
+
+[ ] Sentry or equivalent error tracking configured.
+
+
+
+---
+
+2. Deployment Roadmap
+
+Phase 1: Core Services
+
+[ ] Deploy Redis and DB. Verify connectivity from local environment.
+
+[ ] Deploy Vault and verify secrets are retrievable with retries.
+
+[ ] Deploy Enterprise API (Code Set 5).
+
+[ ] Run smoke tests for:
+
+API auth (API key + JWT)
+
+Rate limiting
+
+PDF malware scan & S3 upload
+
+
+
+Phase 2: LLM Service
+
+[ ] Deploy Policy LLM service (Code Set 3).
+
+[ ] Load PrometheusRules & RemediationPlans.
+
+[ ] Verify:
+
+TPOT P95 latency reporting
+
+Error rate metrics
+
+GPU/queue saturation metrics
+
+
+[ ] Run test requests to validate SLOs and alert triggering.
+
+
+Phase 3: PII Deletion Worker
+
+[ ] Deploy PII worker (Code Set 4).
+
+[ ] Validate transactional deletion and audit hashing.
+
+[ ] Test retry logic and DLQ functionality.
+
+[ ] Ensure optional Fernet encryption is applied and verifiable.
+
+
+Phase 4: Integration & End-to-End
+
+[ ] Submit test applicant via ingestion API.
+
+[ ] Validate flow:
+
+1. API ingestion → Redis stream
+
+
+2. LLM inference → risk scoring
+
+
+3. PII deletion queue → audit log
+
+
+
+[ ] Verify metrics: request counters, latency, LLM call success, DLQ counts.
+
+[ ] Simulate edge cases: invalid JWT, malicious PDFs, rate limits.
+
+
+
+---
+
+3. Post-Deployment / Operations Checklist
+
+Monitoring
+
+[ ] Prometheus metrics streaming correctly.
+
+[ ] Grafana dashboards reflecting live metrics.
+
+[ ] Alerts and remediation plans tested (scaling, failover, security).
+
+[ ] Sentry capturing unhandled exceptions.
+
+
+Security
+
+[ ] JWT and API keys rotated regularly.
+
+[ ] Vault secrets rotation enabled.
+
+[ ] Encrypted storage verified for PII.
+
+[ ] PDF malware detection functional.
+
+
+Resilience & Recovery
+
+[ ] DLQ handling and retries tested.
+
+[ ] Backoff and failover mechanisms validated.
+
+[ ] Disaster recovery procedures documented for DB, Redis, S3, Vault.
+
+
+
+---
+
+4. Continuous Improvement Roadmap
+
+Quarter	Focus	Tasks
+
+Q1	Observability & SLO tuning	Adjust error budgets, latency thresholds, Grafana panels; optimize Prometheus rules.
+Q2	LLM Model Updates	Upgrade or retrain local LLM, validate inference latency, ensure compatibility with API.
+Q3	PII Compliance	Introduce automated compliance checks, audit reporting, encrypted backups.
+Q4	Scale & Automation	Auto-scale LLM pods based on queue/GPU; enhance automated remediation plans.
+
+
+
+---
+
+5. Readiness Sign-Off Criteria
+
+All components deployable via IaC or Helm/Manifests.
+
+End-to-end API request completes successfully with correct risk scoring.
+
+All metrics and dashboards operational.
+
+Alerts trigger expected remediation plans.
+
+PII deletion is transactional, auditable, and optionally encrypted.
+
+Security, rate limiting, and JWT/API key validation verified.
+
+
+
+---
+
+Phase / Quarter       Milestones / Tasks                                QA / Gate
+-------------------------------------------------------------------------------------
+Phase 0: Preparation  (Weeks 1-2)
+----------------------
+- Provision infrastructure: K8s, GPU nodes, Redis, DB
+- Vault deployed & secrets configured
+- Storage (S3) configured
+- Environment variables & config validated
+- Code sets pulled & Docker images built
+QA Gate: Infrastructure & config verified, secrets retrieval tested
+
+Phase 1: Core Services Deployment (Weeks 3-4)
+---------------------------------------------
+- Deploy Enterprise API (Code Set 5)
+- Redis & DB connections validated
+- JWT + API Key authentication tested
+- Rate limiting functional
+- Basic ingestion and S3 upload validated
+QA Gate: Smoke test success, metrics visible, logs validated
+
+Phase 2: LLM Service Deployment (Weeks 5-6)
+--------------------------------------------
+- Deploy Policy LLM service (Code Set 3)
+- PrometheusRules & RemediationPlans loaded
+- TPOT latency, error rate, GPU utilization metrics validated
+- Test LLM inference requests and alert triggers
+QA Gate: LLM responds correctly, SLO metrics accurate, alerts fire as expected
+
+Phase 3: PII Deletion Worker Deployment (Weeks 7-8)
+----------------------------------------------------
+- Deploy PII worker (Code Set 4)
+- Transactional deletion & audit hash verified
+- Retry and DLQ handling tested
+- Optional Fernet encryption validated
+QA Gate: PII deletion end-to-end tested, DLQ entries triggered for failures
+
+Phase 4: Integration & End-to-End Testing (Weeks 9-10)
+------------------------------------------------------
+- Submit test applicant via ingestion API
+- Validate: API → Redis → LLM → Risk scoring → PII deletion
+- Metrics verified: request counts, latency, LLM calls, DLQ counts
+- Edge cases tested: invalid JWT, malicious PDFs, rate limits
+QA Gate: Successful end-to-end workflow, metrics & logs validated, error handling verified
+
+Phase 5: Production Readiness & Operations Handoff (Week 11)
+------------------------------------------------------------
+- Monitoring dashboards (Grafana) finalized
+- Alerts & remediation plans fully operational
+- Security audit: API keys, JWT, Vault secrets rotation
+- Backup & disaster recovery validated
+QA Gate: Ops team sign-off, production runbook completed
+
+Continuous Improvement (Ongoing)
+---------------------------------
+- Quarterly review of SLOs, LLM model updates, scaling & automation
+- Enhancements in PII compliance and audit
+- Metrics & dashboards refinement
+- Disaster recovery drills
+QA Gate: Quarterly audit report, metrics & SLOs meet targets
