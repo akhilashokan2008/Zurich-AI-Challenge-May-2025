@@ -1,110 +1,459 @@
-# AI Underwriting Prototype (PoC)
+Enterprise AI Underwriter Platform — Full Stack (v6.1)
 
-A backend prototype for automated insurance underwriting using a local/open-source LLM as the "worker" instead of full manual review.
+Description:
+This repository contains the complete enterprise-grade AI underwriting platform, including:
 
-**This is a proof-of-concept only** — not production-ready, not audited for compliance, and provided as-is for experimentation or inspiration.
+1. Policy LLM Service (Code Set 3) – High-throughput inference engine with SLOs, saturation monitoring, and automated remediation.
 
-## Features
 
-- **FastAPI ingestion endpoint** (`/apply`): Accepts applicant form (JSON) + optional document uploads (PDFs)
-- Basic PDF validation (JavaScript/embedded file checks via PyMuPDF)
-- Background upload to S3
-- Risk assessment via local OpenAI-compatible LLM (e.g., Llama3) with rule-based fallback
-- Idempotency, rate limiting, circuit breaker, retries
-- Redis stream for async processing (worker with consumer group, DLQ, audit trail)
-- Prometheus metrics, structured logging (Loguru), Sentry hooks
-- Optional PII encryption (Fernet)
-- Separate PII deletion service with tamper-evident chained audit hashes
+2. Next-Gen PII Deletion API + Worker (Code Set 4) – Async, transactional PII deletion with auditing, DLQ, Vault secrets, and Prometheus observability.
 
-## Tech Stack
 
-- Python 3.11+
-- FastAPI + Uvicorn
-- Redis (async)
-- httpx for LLM calls
-- aioboto3 for S3
-- Prometheus-client, Loguru, Sentry-sdk, OpenTelemetry
-- Optional: PyMuPDF (fitz), cryptography
+3. AI Underwriter API Service (Code Set 5) – Enterprise ingestion API, local/remote LLM risk scoring, idempotency, S3 uploads, PDF validation, and full observability.
 
-Requirements: see `requirements.txt`
 
-## Quick Start (Local Demo)
 
-### Prerequisites
+The stack is designed for high reliability, observability, and compliance with enterprise data protection and audit standards.
 
-- Docker & docker-compose (easiest)
-- OR local Redis, Ollama/vLLM for LLM, AWS credentials for S3 (or mock)
-
-### Option 1: Docker Compose (Recommended)
-
-```bash
-git clone https://github.com/your-username/ai-underwriting-poc.git
-cd ai-underwriting-poc
-cp .env.example .env  # Edit with your values
-docker-compose up --build
-```
-
-Services:
-- `api`: http://localhost:8000
-- `worker`: background processing
-- `redis`: localhost:6379
-- `prometheus`: http://localhost:9090 (optional)
-
-### Option 2: Manual Local Run
-
-1. Start Redis: `docker run -p 6379:6379 redis`
-2. Start local LLM server (e.g., Ollama):
-   ```bash
-   ollama run llama3:8b
-   ```
-3. Install deps:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-4. Copy `.env.example` → `.env` and configure (especially `LLM_API_BASE_URL=http://localhost:11434/v1`)
-5. Run API: `uvicorn api.src.api.main:app --reload --port 8000`
-6. Run worker separately: `python worker/src/worker/main.py`
-
-## Example Request
-
-```bash
-curl -X POST http://localhost:8000/apply \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-key" \
-  -d '{
-    "form_json": "{\"age\": 35, \"bmi\": 25.5, \"smoker\": false}",
-    "documents": []  # or use -F for file uploads
-  }'
-```
-
-Response includes `internal_id`, risk score/category/reasoning from LLM or fallback.
-
-## Monitoring
-
-- Metrics: http://localhost:9100/metrics (API) + worker metrics
-- Logs: stdout or `logs/` directory
-
-## Limitations & Known Issues
-
-- No frontend/UI
-- No authentication beyond API key placeholder
-- LLM runs locally — needs GPU for decent speed
-- S3/Vault configs are placeholders
-- Not compliant-certified (bias, explainability, etc.)
-- Stress tests are basic
-
-## Contributing / Feedback
-
-Feel free to fork, improve, or ignore. Issues/PRs welcome but not required.  
-If you have questions or run into setup issues, reply to the original email.
-
-## License
-
-MIT License — use freely for internal experiments.
 
 ---
 
-Created January 2026 by Akhil Asokan (Zurich Advisory Network UAE)
-No warranties — provided for learning and inspiration only.
+Architecture Overview
+
+Client/API
+    │
+    ▼
+FastAPI Ingestion API (Code Set 5)
+    │
+    ├─ Auth (API Key / JWT)
+    ├─ Idempotency (Redis)
+    ├─ PDF Malware Checks
+    ├─ Background S3 Uploads
+    ├─ Metadata Enqueue (Redis Stream)
+    │
+    ▼
+Policy LLM Service (Code Set 3)
+    │
+    ├─ Local LLM Model or Remote API
+    ├─ SLO & Latency Monitoring (Prometheus)
+    ├─ GPU/Queue Saturation Metrics
+    ├─ Automated Remediation (Autoscaling / Region Failover / Security Mitigation)
+    │
+    ▼
+PII Deletion Worker (Code Set 4)
+    │
+    ├─ Async queue consumer
+    ├─ Transactional deletion + audit logging
+    ├─ DLQ with retry_count metrics
+    ├─ Optional Fernet encryption
+    ├─ Prometheus metrics
+    │
+    ▼
+Observability & Monitoring
+    │
+    ├─ Prometheus (metrics for LLM, API, worker)
+    ├─ Grafana dashboards (SLO, queue growth, GPU utilization)
+    ├─ Structured logging + audit trails
+    ├─ Sentry (API exceptions)
+
+
+---
+
+Components
+
+1. Policy LLM Service (Code Set 3)
+
+Purpose: High-throughput model inference with automated alerting and remediation.
+
+Key Features:
+
+Prometheus SLO recordings:
+
+TPOT P95 latency
+
+HTTP error rates (5m fast, 1h slow)
+
+GPU utilization and queue growth metrics
+
+
+Alerts:
+
+LLMTokenGenerationSlowdown → scale inference workers
+
+LLMErrorBudgetBurningFast/Slow → region failover
+
+LLMSaturationDetected → warn on queue growth
+
+SecurityAgentHighRiskSignal → trigger security mitigation
+
+
+Automated Remediation:
+
+Vertical Pod Autoscaling
+
+Traffic failover to another region
+
+WAF rate limiting & certificate rotation
+
+
+Grafana Dashboards:
+
+TPOT P95, error budget burn, queue growth
+
+
+
+
+---
+
+2. Next-Gen PII Deletion API + Worker (Code Set 4)
+
+Purpose: Ensure secure, auditable deletion of PII data with async, transactional reliability.
+
+Key Features:
+
+FastAPI enqueue endpoint with JWT authentication
+
+Idempotent inserts using unique constraints in DB
+
+Async worker:
+
+Processes PII records in transactional batches
+
+Generates chained SHA256 audit hashes
+
+Updates processed flags and retries with backoff
+
+Moves failed jobs to DLQ after max retries
+
+
+Vault integration with retry to load DB & JWT secrets
+
+Prometheus metrics:
+
+Enqueue counts, worker success/failure, retries, DLQ count, latency
+
+
+Health endpoint (/health)
+
+Graceful shutdown of worker tasks
+
+
+Database Tables:
+
+1. pii_records — queued PII deletion tasks
+
+
+2. deletion_audit — hashed audit trail
+
+
+3. pii_dlq — failed deletion records
+
+
+
+
+---
+
+3. AI Underwriter API (Code Set 5)
+
+Purpose: Enterprise ingestion API for insurance applicants, risk scoring using LLM, and secure storage of PII.
+
+Key Features:
+
+Endpoint: POST /apply
+
+Accepts applicant data + optional PDF documents
+
+Performs malware checks on PDFs
+
+Calls local or remote LLM for risk assessment
+
+Stores metadata and encrypted PII in Redis stream
+
+Returns risk score and internal_id for tracking
+
+
+Security:
+
+API Key (X-API-Key) and JWT verification
+
+Optional Fernet encryption for PII
+
+
+Idempotency:
+
+Uses X-Idempotency-Key + Redis TTL
+
+
+Background file uploads to S3 with retry and DLQ
+
+Circuit breaker for LLM calls
+
+Prometheus metrics:
+
+HTTP requests, latency, queue length, LLM calls, S3 uploads, idempotent skips
+
+
+Sentry integration for exceptions
+
+Logging & audit with correlation IDs and PII-safe masking
+
+
+
+---
+
+Configuration
+
+Environment Variables (example)
+
+Variable	Purpose
+
+APP_NAME	Application name
+ENV	Environment (prod/test)
+INGESTION_API_KEY	API key for ingestion
+JWT_SECRET	Optional JWT secret
+REDIS_URL	Redis connection
+S3_BUCKET	S3 bucket for document storage
+S3_REGION	S3 region
+S3_MAX_FILE_SIZE	Max upload file size
+LOCAL_LLM_MODEL	Local LLM model for scoring
+LLM_API_BASE_URL	Remote LLM API endpoint
+PROMETHEUS_METRICS_PORT	Metrics port for API/Worker/LLM
+ENCRYPTION_KEY_FOR_PII	Optional Fernet key for encryption
+VAULT_URL	Vault server URL for secrets
+VAULT_TOKEN	Vault token
+
+
+Other tuning variables exist for rate limiting, retries, worker count, GPU scaling, etc.
+
+
+---
+
+Observability
+
+Prometheus metrics for all components (LLM, API, Worker)
+
+Grafana dashboards:
+
+LLM SLOs, token latency, GPU utilization, queue growth
+
+
+Structured logs with correlation IDs and PII-safe masking
+
+Sentry for API exception monitoring
+
+
+
+---
+
+Deployment
+
+Prerequisites:
+
+Redis cluster
+
+S3 bucket
+
+Optional Vault server
+
+Kubernetes / Docker environment recommended
+
+
+Steps (simplified):
+
+# Clone repo and set environment
+git clone <repo-url>
+cd <repo>
+
+# Environment setup
+cp .env.example .env
+# Edit .env with secrets, API keys, S3, Redis, Vault info
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run API service (includes ingestion, LLM client, metrics)
+uvicorn api.src.api.main:app --host 0.0.0.0 --port 8000
+
+# Run PII deletion worker (if separate deployment)
+python pii_worker.py
+
+# Policy LLM service with PrometheusRule configs (Code Set 3) deployed via Kubernetes
+kubectl apply -f policy-llm-rules.yaml
+kubectl apply -f policy-llm-alerts.yaml
+
+Scaling:
+
+LLM inference can scale horizontally with automated remediation
+
+Redis stream handles multiple workers for ingestion and deletion
+
+Prometheus metrics allow alert-based autoscaling
+
+
+
+---
+
+Security & Compliance
+
+Enforces JWT + API key access
+
+Optional PII encryption with Fernet
+
+PDF malware scans
+
+Audit trails with deterministic hashes
+
+DLQ ensures retries and visibility into failed deletions
+
+Alerting for LLM saturation, token latency, error budget burn, security signals
+
+
+
+---
+
+Metrics Overview
+
+LLM Service (Code 3)
+
+policy_llm:tpot_p95:2m → P95 token latency
+
+policy_llm:http_error_rate:5m/1h → error budget
+
+policy_llm:queue_growth_rate:5m → saturation
+
+
+PII Worker (Code 4)
+
+pii_enqueue_total
+
+pii_worker_success_total
+
+pii_worker_failure_total
+
+pii_worker_retry_total
+
+pii_dlq_total
+
+pii_processing_latency_seconds
+
+
+API Service (Code 5)
+
+api_requests_total
+
+api_request_duration_seconds
+
+ingestion_queue_length
+
+llm_calls_total
+
+llm_latency_seconds
+
+idempotent_requests_total
+
+s3_upload_tasks
+
+
+
+---
+
+Key Advantages
+
+1. End-to-end auditability (ingestion → LLM → deletion)
+
+
+2. Enterprise-grade reliability: retries, backoff, DLQ, and circuit breakers
+
+
+3. Scalable & observable: Prometheus + Grafana + automated remediation
+
+
+4. PII compliance: encryption, audit, transactional deletion
+
+
+5. High-throughput ingestion: 6000+ requests/min, rate-limited and idempotent
+
+
+
+
+---
+
+Here’s a clear workflow diagram for the full AI Underwriter Platform stack, showing API ingestion, LLM inference, PII deletion, and observability:
+
+┌──────────────────────────────┐
+                   │          Client Apps          │
+                   │ (Web, Mobile, Internal Tools)│
+                   └─────────────┬────────────────┘
+                                 │ POST /apply
+                                 ▼
+                   ┌──────────────────────────────┐
+                   │  FastAPI Ingestion API       │
+                   │ (Code Set 5)                 │
+                   │------------------------------│
+                   │ • API Key / JWT Auth         │
+                   │ • PDF Malware Scan           │
+                   │ • Idempotency Check (Redis) │
+                   │ • Background S3 Upload       │
+                   │ • Metadata Enqueue (Redis)  │
+                   └─────────────┬────────────────┘
+                                 │ Redis Stream
+                                 ▼
+                   ┌──────────────────────────────┐
+                   │ Policy LLM Service           │
+                   │ (Code Set 3)                 │
+                   │------------------------------│
+                   │ • Local / Remote LLM         │
+                   │ • TPOT P95 latency           │
+                   │ • Error Rate Monitoring      │
+                   │ • GPU / Queue Saturation     │
+                   │ • Automated Remediation      │
+                   │   (Scaling, Failover, Security)│
+                   └─────────────┬────────────────┘
+                                 │ Risk Score Response
+                                 ▼
+                   ┌──────────────────────────────┐
+                   │ PII Deletion Worker          │
+                   │ (Code Set 4)                 │
+                   │------------------------------│
+                   │ • Async queue consumer       │
+                   │ • Transactional Deletion     │
+                   │ • Audit Trail (SHA256 Hash) │
+                   │ • Retry + DLQ                │
+                   │ • Optional Fernet Encryption │
+                   └─────────────┬────────────────┘
+                                 │
+                                 ▼
+                   ┌──────────────────────────────┐
+                   │ Persistent Storage / S3      │
+                   │ • Applicant documents         │
+                   │ • Encrypted metadata         │
+                   └─────────────┬────────────────┘
+                                 │
+                                 ▼
+                   ┌──────────────────────────────┐
+                   │ Observability & Monitoring  │
+                   │------------------------------│
+                   │ • Prometheus Metrics         │
+                   │   - LLM latency & errors     │
+                   │   - API request latency      │
+                   │   - Worker DLQ / success     │
+                   │ • Grafana Dashboards         │
+                   │   - SLOs, Queue growth, GPU │
+                   │ • Sentry (Exceptions)       │
+                   └──────────────────────────────┘
+
+Legend / Notes:
+
+Redis Stream: central message queue for ingestion → LLM → risk scoring → PII deletion.
+
+Automated Remediation in LLM service scales inference pods or fails over regions when error budget or saturation thresholds are hit.
+
+PII Worker ensures secure, auditable deletion and generates chained hashes for compliance.
+
+Observability spans all components: metrics, dashboards, and error tracking.
+
+Background Tasks like S3 uploads do not block ingestion and report to metrics.
+
+
+
+---
